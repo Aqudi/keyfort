@@ -1,0 +1,12 @@
+.DS_Store
+node_modules/
+screenshot-*.png
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# secrets / local state
+.env
+.env.*
+.omc/
+*.pem
