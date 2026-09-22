@@ -62,3 +62,75 @@ test("login falls back to an ephemeral device id when chrome.storage throws", as
   assert.match(sentBody.get("deviceIdentifier"), /^[0-9a-f-]{36}$/);
   assert.equal(warn.mock.callCount(), 1);
 });
+
+// Vaultwarden answers a 2FA-protected login with 400 + TwoFactorProviders.
+const TWO_FACTOR_REQUIRED = {
+  error: "invalid_grant",
+  error_description: "Two factor required.",
+  TwoFactorProviders: [0],
+};
+
+test("login flags a 2FA challenge with the offered providers", async () => {
+  fetchImpl = async () => jsonResponse(TWO_FACTOR_REQUIRED, 400);
+  await assert.rejects(new VaultwardenClient("https://vault.test").login("user@example.test", "hash"), (err) => {
+    assert.equal(err.twoFactorRequired, true);
+    assert.deepEqual(err.twoFactorProviders, [0]);
+    return true;
+  });
+});
+
+test("login does not flag ordinary auth failures as 2FA", async () => {
+  fetchImpl = async () => jsonResponse({ error: "invalid_grant", error_description: "Username or password is incorrect." }, 400);
+  await assert.rejects(new VaultwardenClient("https://vault.test").login("user@example.test", "hash"), (err) => {
+    assert.notEqual(err.twoFactorRequired, true);
+    return true;
+  });
+});
+
+test("login sends the authenticator code as twoFactorToken/twoFactorProvider", async () => {
+  let sentBody;
+  fetchImpl = async (_url, opts) => {
+    sentBody = new URLSearchParams(opts.body);
+    return jsonResponse({ access_token: "a", refresh_token: "r" });
+  };
+  await new VaultwardenClient("https://vault.test").login("user@example.test", "hash", { token: "123456", provider: 0 });
+  assert.equal(sentBody.get("twoFactorToken"), "123456");
+  assert.equal(sentBody.get("twoFactorProvider"), "0");
+  assert.equal(sentBody.get("twoFactorRemember"), "0");
+});
+
+test("createCipher posts the cipher and returns the created resource", async () => {
+  let sentUrl, sentOpts;
+  fetchImpl = async (url, opts) => {
+    sentUrl = url;
+    sentOpts = opts;
+    return jsonResponse({ id: "new-id", type: 1 });
+  };
+  const cipher = { type: 1, name: "enc-name" };
+  const result = await new VaultwardenClient("https://vault.test").createCipher("tok", cipher);
+  assert.equal(sentUrl, "https://vault.test/api/ciphers");
+  assert.equal(sentOpts.method, "POST");
+  assert.equal(sentOpts.headers.authorization, "Bearer tok");
+  assert.deepEqual(JSON.parse(sentOpts.body), cipher);
+  assert.deepEqual(result, { id: "new-id", type: 1 });
+});
+
+test("createCipher throws the server's error message on failure", async () => {
+  fetchImpl = async () => jsonResponse({ Message: "bad cipher" }, 400);
+  await assert.rejects(
+    new VaultwardenClient("https://vault.test").createCipher("tok", {}),
+    /bad cipher/
+  );
+});
+
+test("deleteCipher sends a DELETE to the cipher's id", async () => {
+  let sentUrl, sentOpts;
+  fetchImpl = async (url, opts) => {
+    sentUrl = url;
+    sentOpts = opts;
+    return jsonResponse({});
+  };
+  await new VaultwardenClient("https://vault.test").deleteCipher("tok", "abc 123");
+  assert.equal(sentUrl, "https://vault.test/api/ciphers/abc%20123");
+  assert.equal(sentOpts.method, "DELETE");
+});

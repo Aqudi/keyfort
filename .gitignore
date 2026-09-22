@@ -10,3 +10,4 @@ screenshot-*.png
 .env.*
 .omc/
 *.pem
+.playwright-cli/

@@ -1,16 +1,36 @@
+/* 웜 그래파이트 + 앰버 단일 accent. 다크 기본, 시스템 설정에 따라 라이트 전환. */
 :root {
-  --bg: #14151a;
-  --bg-elevated: #1d1f26;
-  --bg-hover: #262832;
-  --border: #2c2e38;
-  --text: #eef0f5;
-  --text-muted: #9a9db0;
-  --accent: #4b74ff;
-  --accent-hover: #6288ff;
-  --danger: #ff5c6c;
-  --success: #37c990;
+  color-scheme: dark light;
+  --bg: #171614;
+  --bg-elevated: #201f1c;
+  --bg-hover: #2a2823;
+  --border: #34322c;
+  --text: #f0ede6;
+  --text-muted: #a09b8f;
+  --accent: #f5a524;
+  --accent-hover: #ffb84a;
+  --on-accent: #1c1306;
+  --danger: #ff6b5e;
+  --success: #6fcf97;
   --radius: 10px;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #faf8f4;
+    --bg-elevated: #ffffff;
+    --bg-hover: #f0ece3;
+    --border: #e3ddd0;
+    --text: #211f1a;
+    --text-muted: #6b665b;
+    --accent: #b45309;
+    --accent-hover: #92400e;
+    --on-accent: #ffffff;
+    --danger: #c0392b;
+    --success: #2f855a;
+  }
 }
 
 * { box-sizing: border-box; }
@@ -42,22 +62,22 @@ body {
   font-size: 15px;
 }
 
-.brand .dot {
-  width: 10px; height: 10px; border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 8px var(--accent);
-}
+.brand .mark { width: 20px; height: 20px; color: var(--accent); flex-shrink: 0; }
 
 .icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 30px; height: 30px;
   background: transparent;
   border: none;
   color: var(--text-muted);
   cursor: pointer;
-  padding: 6px;
+  padding: 0 6px;
   border-radius: 6px;
-  font-size: 13px;
+  font-size: 12px;
 }
 .icon-btn:hover { background: var(--bg-hover); color: var(--text); }
+.icon { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .body { flex: 1; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 
@@ -83,15 +103,15 @@ input:focus { border-color: var(--accent); }
   font-size: 13px;
   cursor: pointer;
 }
-.btn-primary { background: var(--accent); color: white; }
+.btn-primary { background: var(--accent); color: var(--on-accent); }
 .btn-primary:hover { background: var(--accent-hover); }
 .btn-secondary { background: var(--bg-elevated); color: var(--text); border: 1px solid var(--border); }
 .btn-secondary:hover { background: var(--bg-hover); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .error-box {
-  background: rgba(255, 92, 108, 0.12);
-  border: 1px solid rgba(255, 92, 108, 0.35);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
   color: var(--danger);
   padding: 8px 10px;
   border-radius: 8px;
@@ -104,7 +124,7 @@ input:focus { border-color: var(--accent); }
 .search-box input { padding-left: 32px; }
 .search-box .search-icon {
   position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
-  color: var(--text-muted); font-size: 13px;
+  color: var(--text-muted); display: flex;
 }
 
 .item-list { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; max-height: 360px; }
@@ -122,12 +142,15 @@ input:focus { border-color: var(--accent); }
 .item-card:hover { background: var(--bg-hover); border-color: var(--accent); }
 
 .item-favicon {
+  position: relative; overflow: hidden;
   width: 32px; height: 32px; border-radius: 8px;
-  background: linear-gradient(135deg, var(--accent), #8b5cf6);
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
   display: flex; align-items: center; justify-content: center;
-  color: white; font-weight: 700; font-size: 13px;
+  color: var(--text-muted); font-weight: 700; font-size: 12px;
   flex-shrink: 0;
 }
+.item-favicon img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: var(--bg-elevated); }
 
 .item-meta { flex: 1; min-width: 0; }
 .item-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -137,8 +160,8 @@ input:focus { border-color: var(--accent); }
 
 .badge-totp {
   font-size: 10px;
-  background: rgba(75,116,255,0.15);
-  color: var(--accent-hover);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
   padding: 2px 6px;
   border-radius: 6px;
   flex-shrink: 0;
@@ -176,14 +199,14 @@ input:focus { border-color: var(--accent); }
   border-radius: var(--radius);
   padding: 10px 12px;
 }
-.detail-value { font-family: ui-monospace, monospace; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-value { font-family: var(--font-mono); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detail-actions { display: flex; gap: 4px; }
 
 .totp-code {
   font-size: 20px;
   font-weight: 700;
   letter-spacing: 2px;
-  font-family: ui-monospace, monospace;
+  font-family: var(--font-mono);
 }
 
 .back-btn {
@@ -201,7 +224,7 @@ input:focus { border-color: var(--accent); }
   left: 50%;
   transform: translateX(-50%);
   background: var(--accent);
-  color: white;
+  color: var(--on-accent);
   padding: 6px 14px;
   border-radius: 20px;
   font-size: 12px;
@@ -210,3 +233,9 @@ input:focus { border-color: var(--accent); }
   pointer-events: none;
 }
 .toast.show { opacity: 1; }
+
+/* options page */
+body.page { width: auto; min-height: 0; max-width: 480px; padding: 24px; }
+body.page h1 { font-size: 16px; display: flex; align-items: center; gap: 8px; }
+body.page p { color: var(--text-muted); font-size: 13px; }
+.icon-btn:disabled { opacity: 0.5; cursor: not-allowed; }

@@ -1,17 +1,27 @@
 {
   "manifest_version": 3,
-  "name": "1PW Clone (Vaultwarden Client)",
+  "name": "Keyfort",
   "version": "0.1.0",
-  "description": "1Password-style browser extension for your self-hosted Vaultwarden vault.",
+  "description": "Keyfort — an unofficial client for your own self-hosted Vaultwarden or other Bitwarden-compatible server.",
   "action": {
     "default_popup": "src/popup.html",
-    "default_title": "1PW Clone"
+    "default_title": "Keyfort",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png"
+    }
   },
   "background": {
     "service_worker": "src/background.js",
     "type": "module"
   },
-  "permissions": ["storage", "activeTab", "scripting", "alarms"],
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "alarms"
+  ],
   "host_permissions": [
     "https://localhost:8443/*",
     "https://*/*",
@@ -19,10 +29,20 @@
   ],
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["src/content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "src/content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
-  "options_page": "src/options.html"
+  "options_page": "src/options.html",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
 }

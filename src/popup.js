@@ -1,5 +1,9 @@
 // src/popup.js - UI logic for the extension popup.
 
+import { icon } from "./icons.js";
+import { brandHtml } from "./brand.js";
+import { uriHostname, isSameSite } from "./lib/site.js";
+
 const app = document.getElementById("app");
 
 const TOAST_MS = 1200;
@@ -57,27 +61,26 @@ function escapeHtml(str) {
     .replace(/'/g, "&#39;");
 }
 
-// "https://a.com/x" 또는 스킴 없는 "a.com" 모두에서 hostname을 뽑는다. 실패하면 null.
-function uriHostname(uri) {
-  for (const candidate of [uri, `https://${uri}`]) {
-    try {
-      const { hostname } = new URL(candidate);
-      if (hostname) return hostname.toLowerCase();
-    } catch {
-      // 스킴 없는 형태일 수 있으므로 다음 후보로 재시도
-    }
-  }
-  return null;
-}
-
-// 정확히 같은 호스트이거나 한쪽이 다른 쪽의 서브도메인이면 true.
-function isSameSite(a, b) {
-  if (!a || !b) return false;
-  return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
-}
-
 function initials(name) {
   return (name || "?").trim().slice(0, 2).toUpperCase();
+}
+
+// 서버(Vaultwarden) 아이콘 서비스로 파비콘을 받고, 실패하면 이니셜 타일이 그대로 보인다.
+let serverUrl = "";
+
+function faviconHtml(item, extraStyle = "") {
+  const host = item.uris.map(uriHostname).find(Boolean);
+  const img = host && serverUrl
+    ? `<img src="${escapeHtml(serverUrl.replace(/\/+$/, ""))}/icons/${encodeURIComponent(host)}/icon.png" alt="" />`
+    : "";
+  return `<div class="item-favicon" style="${extraStyle}">${escapeHtml(initials(item.name))}${img}</div>`;
+}
+
+// MV3 CSP상 인라인 onerror를 쓸 수 없어 렌더 후 리스너를 단다.
+function hideBrokenIcons(root) {
+  root.querySelectorAll(".item-favicon img").forEach((img) => {
+    img.addEventListener("error", () => img.remove());
+  });
 }
 
 async function getActiveTabHost() {
@@ -97,7 +100,7 @@ function renderLogin(prefill = {}) {
   stopTotpTimer();
   app.innerHTML = `
     <div class="header">
-      <div class="brand"><span class="dot"></span>1PW Clone</div>
+      ${brandHtml()}
     </div>
     <div class="body">
       <div>
@@ -112,6 +115,10 @@ function renderLogin(prefill = {}) {
         <label class="field-label">마스터 비밀번호</label>
         <input type="password" id="password" placeholder="Master password" />
       </div>
+      <div id="twoFactorRow" hidden>
+        <label class="field-label">인증 앱 코드 (2단계 인증)</label>
+        <input type="text" id="twoFactorCode" inputmode="numeric" autocomplete="one-time-code" maxlength="8" placeholder="123456" />
+      </div>
       <div id="errorBox"></div>
       <button class="btn btn-primary" id="loginBtn">잠금 해제</button>
     </div>
@@ -124,19 +131,28 @@ function renderLogin(prefill = {}) {
     const serverUrl = document.getElementById("serverUrl").value.trim();
     const email = document.getElementById("email").value.trim();
     const password = document.getElementById("password").value;
+    const twoFactorRow = document.getElementById("twoFactorRow");
+    const twoFactorInput = document.getElementById("twoFactorCode");
+    const twoFactorCode = twoFactorRow.hidden ? "" : twoFactorInput.value.trim();
     const btn = document.getElementById("loginBtn");
     const errorBox = document.getElementById("errorBox");
     errorBox.innerHTML = "";
-    if (!serverUrl || !email || !password) {
+    if (!serverUrl || !email || !password || (!twoFactorRow.hidden && !twoFactorCode)) {
       errorBox.innerHTML = `<div class="error-box">모든 필드를 입력하세요.</div>`;
       return;
     }
     btn.disabled = true;
     btn.textContent = "로그인 중...";
     try {
-      const res = await send({ type: "LOGIN", serverUrl, email, password });
+      const res = await send({ type: "LOGIN", serverUrl, email, password, twoFactorCode });
       if (res?.ok) {
         renderVault();
+        return;
+      }
+      if (res?.twoFactorRequired) {
+        twoFactorRow.hidden = false;
+        twoFactorInput.focus();
+        errorBox.innerHTML = `<div class="error-box">2단계 인증 코드를 입력하세요.</div>`;
         return;
       }
       errorBox.innerHTML = `<div class="error-box">${escapeHtml(res?.error || "알 수 없는 오류")}</div>`;
@@ -149,27 +165,29 @@ function renderLogin(prefill = {}) {
   });
 
   // Enter key submits
-  document.getElementById("password").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") document.getElementById("loginBtn").click();
-  });
+  for (const id of ["password", "twoFactorCode"]) {
+    document.getElementById(id).addEventListener("keydown", (e) => {
+      if (e.key === "Enter") document.getElementById("loginBtn").click();
+    });
+  }
 }
 
 async function renderVault() {
   stopTotpTimer();
   app.innerHTML = `
     <div class="header">
-      <div class="brand"><span class="dot"></span>1PW Clone</div>
+      ${brandHtml()}
       <div style="display:flex; gap:4px;">
-        <button class="icon-btn" id="syncBtn" title="동기화">⟳</button>
-        <button class="icon-btn" id="lockBtn" title="잠금">🔒</button>
+        <button class="icon-btn" id="syncBtn" title="동기화" aria-label="동기화">${icon("sync")}</button>
+        <button class="icon-btn" id="lockBtn" title="잠금" aria-label="잠금">${icon("lock")}</button>
       </div>
     </div>
     <div class="body">
       <div class="search-box">
-        <span class="search-icon">🔍</span>
+        <span class="search-icon">${icon("search")}</span>
         <input type="text" id="search" placeholder="항목 검색..." />
       </div>
-      <div id="currentSiteRow" style="font-size:11px; color:var(--text-muted);"></div>
+      <div id="currentSiteRow" style="font-size:11px; color:var(--text-muted); display:flex; align-items:center; gap:6px;"></div>
       <div class="item-list" id="itemList"><div class="empty-state">불러오는 중...</div></div>
       <div id="skippedNote" style="font-size:11px; color:var(--text-muted);"></div>
     </div>
@@ -187,7 +205,6 @@ async function renderVault() {
   document.getElementById("syncBtn").addEventListener("click", async () => {
     const btn = document.getElementById("syncBtn");
     btn.disabled = true;
-    btn.textContent = "…";
     try {
       const res = await send({ type: "SYNC" });
       if (await handleLockedResponse(res)) return;
@@ -200,7 +217,6 @@ async function renderVault() {
       showToast(`동기화 실패: ${err.message}`, ERROR_TOAST_MS);
     } finally {
       btn.disabled = false;
-      btn.textContent = "⟳";
     }
   });
 
@@ -210,6 +226,7 @@ async function renderVault() {
 
   let allItems = [];
   const host = await getActiveTabHost();
+  serverUrl = (await send({ type: "GET_CONFIG" }))?.serverUrl || "";
 
   async function loadItems() {
     const res = await send({ type: "GET_ITEMS" });
@@ -225,9 +242,9 @@ async function renderVault() {
     if (host) {
       const siteRow = document.getElementById("currentSiteRow");
       const matches = allItems.filter((i) => i.uris.some((u) => u.includes(host)));
-      siteRow.textContent = matches.length
-        ? `🌐 ${host}에 대한 항목 ${matches.length}개`
-        : `🌐 ${host} — 저장된 항목 없음`;
+      siteRow.innerHTML = `${icon("globe")}<span>${escapeHtml(
+        matches.length ? `${host}에 대한 항목 ${matches.length}개` : `${host} — 저장된 항목 없음`
+      )}</span>`;
     }
     filterAndRender("");
   }
@@ -262,7 +279,7 @@ async function renderVault() {
       .map(
         (item) => `
       <div class="item-card" data-id="${escapeHtml(item.id)}">
-        <div class="item-favicon">${escapeHtml(initials(item.name))}</div>
+        ${faviconHtml(item)}
         <div class="item-meta">
           <div class="item-name">${escapeHtml(item.name || "(이름 없음)")}</div>
           <div class="item-sub">${escapeHtml(item.username || "")}</div>
@@ -273,6 +290,7 @@ async function renderVault() {
       )
       .join("");
 
+    hideBrokenIcons(listEl);
     listEl.querySelectorAll(".item-card").forEach((card) => {
       card.addEventListener("click", () => renderItemDetail(card.dataset.id, allItems));
     });
@@ -295,12 +313,12 @@ async function renderItemDetail(id, allItems) {
 
   app.innerHTML = `
     <div class="header">
-      <div class="brand"><span class="dot"></span>1PW Clone</div>
+      ${brandHtml()}
     </div>
     <div class="body">
-      <div class="back-btn" id="backBtn">← 목록으로</div>
+      <div class="back-btn" id="backBtn">${icon("back")} 목록으로</div>
       <div style="display:flex; align-items:center; gap:10px;">
-        <div class="item-favicon" style="width:40px;height:40px;font-size:15px;">${escapeHtml(initials(item.name))}</div>
+        ${faviconHtml(item, "width:40px;height:40px;font-size:15px;")}
         <div>
           <div style="font-weight:700; font-size:15px;">${escapeHtml(item.name)}</div>
           <div class="item-sub">${item.uris[0] ? escapeHtml(item.uris[0]) : ""}</div>
@@ -316,7 +334,7 @@ async function renderItemDetail(id, allItems) {
           <div class="detail-value">${escapeHtml(item.username)}</div>
         </div>
         <div class="detail-actions">
-          <button class="icon-btn" id="copyUsername">복사</button>
+          <button class="icon-btn" id="copyUsername" title="복사" aria-label="사용자 이름 복사">${icon("copy")}</button>
         </div>
       </div>`
           : ""
@@ -328,8 +346,8 @@ async function renderItemDetail(id, allItems) {
           <div class="detail-value" id="pwField">••••••••••••</div>
         </div>
         <div class="detail-actions">
-          <button class="icon-btn" id="togglePw">보기</button>
-          <button class="icon-btn" id="copyPassword">복사</button>
+          <button class="icon-btn" id="togglePw" title="보기" aria-label="비밀번호 보기">${icon("eye")}</button>
+          <button class="icon-btn" id="copyPassword" title="복사" aria-label="비밀번호 복사">${icon("copy")}</button>
         </div>
       </div>
 
@@ -342,7 +360,7 @@ async function renderItemDetail(id, allItems) {
           <div class="totp-code" id="totpCode">${res.totp.code.slice(0, 3)} ${res.totp.code.slice(3)}</div>
         </div>
         <div class="detail-actions">
-          <button class="icon-btn" id="copyTotp">복사</button>
+          <button class="icon-btn" id="copyTotp" title="복사" aria-label="인증 코드 복사">${icon("copy")}</button>
         </div>
       </div>`
           : ""
@@ -353,12 +371,15 @@ async function renderItemDetail(id, allItems) {
   `;
 
   document.getElementById("backBtn").addEventListener("click", renderVault);
+  hideBrokenIcons(app);
 
   const pwField = document.getElementById("pwField");
   let pwVisible = false;
-  document.getElementById("togglePw").addEventListener("click", () => {
+  const toggleBtn = document.getElementById("togglePw");
+  toggleBtn.addEventListener("click", () => {
     pwVisible = !pwVisible;
     pwField.textContent = pwVisible ? res.password : "••••••••••••";
+    toggleBtn.innerHTML = icon(pwVisible ? "eyeOff" : "eye");
   });
 
   document.getElementById("copyUsername")?.addEventListener("click", () => copyToClipboard(item.username, "사용자 이름"));

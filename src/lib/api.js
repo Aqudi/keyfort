@@ -55,7 +55,8 @@ export class VaultwardenClient {
   }
 
   // masterPasswordHashB64: base64 hash computed via hashMasterKey()
-  async login(email, masterPasswordHashB64) {
+  // twoFactor: { token, provider } — 서버가 2단계 인증을 요구할 때 두 번째 호출에서 넘긴다.
+  async login(email, masterPasswordHashB64, twoFactor) {
     const body = new URLSearchParams({
       grant_type: "password",
       username: email,
@@ -64,7 +65,12 @@ export class VaultwardenClient {
       client_id: "browser",
       deviceType: DEVICE_TYPE_CHROME_EXTENSION,
       deviceIdentifier: await getDeviceIdentifier(),
-      deviceName: "1pw-clone-extension",
+      deviceName: "keyfort-extension",
+      ...(twoFactor && {
+        twoFactorToken: twoFactor.token,
+        twoFactorProvider: String(twoFactor.provider),
+        twoFactorRemember: "0",
+      }),
     });
     const res = await fetch(`${this.serverUrl}/identity/connect/token`, {
       method: "POST",
@@ -76,6 +82,10 @@ export class VaultwardenClient {
       const msg = data.error_description || data.ErrorModel?.Message || data.error || `login failed: ${res.status}`;
       const err = new Error(msg);
       err.raw = data;
+      if (Array.isArray(data.TwoFactorProviders)) {
+        err.twoFactorRequired = true;
+        err.twoFactorProviders = data.TwoFactorProviders.map(Number);
+      }
       throw err;
     }
     return data; // { access_token, refresh_token, Key, PrivateKey, ... }
@@ -102,5 +112,27 @@ export class VaultwardenClient {
     });
     if (!res.ok) throw new Error(`sync failed: ${res.status}`);
     return res.json();
+  }
+
+  // cipher: 이미 암호화된(EncString) 필드로 구성된 Bitwarden Cipher 요청 바디.
+  async createCipher(accessToken, cipher) {
+    const res = await fetch(`${this.serverUrl}/api/ciphers`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify(cipher),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.Message || data.message || `create cipher failed: ${res.status}`);
+    }
+    return data;
+  }
+
+  async deleteCipher(accessToken, id) {
+    const res = await fetch(`${this.serverUrl}/api/ciphers/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) throw new Error(`delete cipher failed: ${res.status}`);
   }
 }

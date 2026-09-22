@@ -1,7 +1,7 @@
 # Handoff: Vaultwarden + 1Password-style Chrome Extension
 
 ## 배경
-사용자가 1Password 대신 셀프호스팅 Vaultwarden + 자체 제작 Chrome 확장(1PW Clone)을
+사용자가 1Password 대신 셀프호스팅 Vaultwarden + 자체 제작 Chrome 확장(Keyfort)을
 써보고 싶어해서 로컬 맥미니에 전체 스택을 구축했다. 지금은 동작 프로토타입 단계이며,
 보안 하드닝과 UX 다듬기가 남아있다.
 
@@ -32,8 +32,8 @@
 - vault 안에 테스트 로그인 아이템 1개 존재: "Example Test Login"
   (username/password/TOTP seed 값은 문서에 기록하지 않음 — 웹볼트에서 확인)
 
-## Chrome 확장: 1PW Clone
-- 위치: `~/1pw-clone/`
+## Chrome 확장: Keyfort
+- 위치: `~/Utils/1pw-clone/`
 - Manifest V3, 압축해제 상태로 Chrome에 로드됨 (`chrome://extensions` 개발자 모드)
 - 확장 ID: `pfjklhbieaoaoaejajfbfbekkfehpnpb` (재로드하면 바뀔 수 있음)
 

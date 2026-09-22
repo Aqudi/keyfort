@@ -2,7 +2,7 @@
 // No network, no real secrets: all keys are random and generated per run.
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { encryptString, bytesToB64 } from "../src/lib/crypto.js";
+import { encryptString, decryptEncString, bytesToB64 } from "../src/lib/crypto.js";
 
 // ---- chrome / fetch mocks (installed before background.js is imported) ----
 const store = { local: {}, session: {} };
@@ -33,6 +33,8 @@ const storageArea = (backing) => ({
   },
 });
 
+const tabMessages = []; // {tabId, msg} sent via chrome.tabs.sendMessage (DO_AUTOFILL relay)
+
 globalThis.chrome = {
   storage: { local: storageArea(store.local), session: storageArea(store.session) },
   alarms: {
@@ -43,6 +45,12 @@ globalThis.chrome = {
       delete alarms[name];
     },
     onAlarm: { addListener: (fn) => (alarmListener = fn) },
+  },
+  tabs: {
+    async sendMessage(tabId, msg) {
+      tabMessages.push({ tabId, msg });
+      return { ok: true };
+    },
   },
   runtime: {
     id: EXT_ID,
@@ -99,10 +107,13 @@ beforeEach(() => {
   for (const area of [store.local, store.session, alarms]) {
     for (const k of Object.keys(area)) delete area[k];
   }
+  tabMessages.length = 0;
   fetchImpl = async () => {
     throw new Error("unexpected fetch");
   };
 });
+
+const contentScriptSender = (tabId, url) => ({ id: EXT_ID, tab: { id: tabId, url }, url });
 
 // ---- tests ----
 test("LOCK during an in-flight SYNC does not resurrect the session", async () => {
@@ -259,4 +270,156 @@ test("GET_ITEM_SECRETS returns a TOTP code for a valid seed", async () => {
   assert.equal(res.password, "pw");
   assert.equal(res.totpError, undefined);
   assert.ok(res.totp);
+});
+
+// ---- content-script surface: host matches, autofill, save prompt ----------
+
+test("a content script may send GET_HOST_MATCHES/REQUEST_AUTOFILL/PENDING_SAVE/GET_PENDING_SAVE/SAVE_ITEM, nothing else", async () => {
+  seedSession([]);
+  const sender = contentScriptSender(1, "https://evil.test/page");
+
+  assert.notDeepEqual(await send({ type: "GET_HOST_MATCHES" }, sender), { ok: false, error: "forbidden" });
+  assert.deepEqual(await send({ type: "SYNC" }, sender), { ok: false, error: "forbidden" });
+  assert.deepEqual(await send({ type: "GET_ITEMS" }, sender), { ok: false, error: "forbidden" });
+});
+
+test("GET_HOST_MATCHES returns only items whose saved uri matches the tab's real host", async () => {
+  seedSession([
+    await makeCipher("1", "example", userKey), // uris: https://example.test
+    await makeCipher("2", "other", userKey, {
+      login: { username: await encryptString("u", userKey), password: await encryptString("p", userKey), uris: [{ uri: await encryptString("https://other.test", userKey) }] },
+    }),
+  ]);
+
+  const res = await send({ type: "GET_HOST_MATCHES" }, contentScriptSender(1, "https://example.test/login"));
+
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.items.map((i) => i.id), ["1"]);
+  assert.equal(res.items[0].password, undefined); // 비밀번호는 절대 포함하지 않는다
+});
+
+test("GET_HOST_MATCHES ignores the host a malicious page claims and uses sender.tab.url instead", async () => {
+  seedSession([await makeCipher("1", "example", userKey)]);
+
+  const res = await send(
+    { type: "GET_HOST_MATCHES", host: "example.test" }, // 위조 시도
+    contentScriptSender(1, "https://attacker.test/page")
+  );
+
+  assert.deepEqual(res.items, []);
+});
+
+test("GET_HOST_MATCHES returns nothing while locked (no nagging for master password)", async () => {
+  const res = await send({ type: "GET_HOST_MATCHES" }, contentScriptSender(1, "https://example.test/login"));
+  assert.deepEqual(res, { ok: true, items: [] });
+});
+
+test("REQUEST_AUTOFILL decrypts and relays DO_AUTOFILL to the requesting tab only", async () => {
+  seedSession([await makeCipher("1", "example", userKey)]);
+
+  const res = await send({ type: "REQUEST_AUTOFILL", id: "1", submit: true }, contentScriptSender(9, "https://example.test/login"));
+
+  assert.equal(res.ok, true);
+  assert.equal(tabMessages.length, 1);
+  assert.deepEqual(tabMessages[0], {
+    tabId: 9,
+    msg: { type: "DO_AUTOFILL", username: "user-example", password: "pw", submit: true },
+  });
+});
+
+test("REQUEST_AUTOFILL refuses an item whose saved site does not match the current tab", async () => {
+  seedSession([await makeCipher("1", "example", userKey)]); // uris: https://example.test
+
+  const res = await send({ type: "REQUEST_AUTOFILL", id: "1" }, contentScriptSender(9, "https://attacker.test/login"));
+
+  assert.equal(res.ok, false);
+  assert.equal(tabMessages.length, 0);
+});
+
+test("REQUEST_AUTOFILL fails while locked instead of throwing", async () => {
+  const res = await send({ type: "REQUEST_AUTOFILL", id: "1" }, contentScriptSender(9, "https://example.test/login"));
+  assert.deepEqual(res, { ok: false, error: "Locked" });
+});
+
+test("PENDING_SAVE then GET_PENDING_SAVE round-trips a new login for the same tab/host", async () => {
+  seedSession([]);
+  const sender = contentScriptSender(3, "https://newsite.test/login");
+
+  await send({ type: "PENDING_SAVE", username: "me@example.test", password: "hunter2" }, sender);
+  const res = await send({ type: "GET_PENDING_SAVE" }, sender);
+
+  assert.deepEqual(res.pending, { host: "newsite.test", username: "me@example.test", password: "hunter2" });
+});
+
+test("GET_PENDING_SAVE is one-shot: a second read returns null", async () => {
+  seedSession([]);
+  const sender = contentScriptSender(3, "https://newsite.test/login");
+  await send({ type: "PENDING_SAVE", username: "me@example.test", password: "hunter2" }, sender);
+
+  await send({ type: "GET_PENDING_SAVE" }, sender);
+  const second = await send({ type: "GET_PENDING_SAVE" }, sender);
+
+  assert.equal(second.pending, null);
+});
+
+test("PENDING_SAVE does not queue when that username is already saved for the site", async () => {
+  seedSession([await makeCipher("1", "example", userKey)]); // username: user-example, uri: example.test
+  const sender = contentScriptSender(3, "https://example.test/login");
+
+  await send({ type: "PENDING_SAVE", username: "user-example", password: "hunter2" }, sender);
+  const res = await send({ type: "GET_PENDING_SAVE" }, sender);
+
+  assert.equal(res.pending, null);
+});
+
+test("PENDING_SAVE ignores an oversized captured value instead of storing it", async () => {
+  seedSession([]);
+  const sender = contentScriptSender(3, "https://newsite.test/login");
+
+  await send({ type: "PENDING_SAVE", username: "me@example.test", password: "x".repeat(5000) }, sender);
+  const res = await send({ type: "GET_PENDING_SAVE" }, sender);
+
+  assert.equal(res.pending, null);
+});
+
+test("GET_PENDING_SAVE refuses a stale entry if the tab navigated to a different site meanwhile", async () => {
+  seedSession([]);
+  await send({ type: "PENDING_SAVE", username: "me@example.test", password: "hunter2" }, contentScriptSender(3, "https://siteA.test/login"));
+
+  const res = await send({ type: "GET_PENDING_SAVE" }, contentScriptSender(3, "https://siteB.test/"));
+
+  assert.equal(res.pending, null);
+});
+
+test("SAVE_ITEM creates an encrypted cipher on the server and appends it to the session", async () => {
+  seedSession([]);
+  let posted;
+  fetchImpl = async (url, opts) => {
+    posted = { url, body: JSON.parse(opts.body) };
+    return jsonResponse({ id: "created-1", type: 1, ...posted.body });
+  };
+
+  const res = await send(
+    { type: "SAVE_ITEM", host: "newsite.test", username: "me@example.test", password: "hunter2" },
+    contentScriptSender(3, "https://newsite.test/login")
+  );
+
+  assert.equal(res.ok, true);
+  assert.equal(posted.url, "https://vault.test/api/ciphers");
+  assert.equal(posted.body.type, 1);
+  assert.notEqual(posted.body.login.password, "hunter2"); // 평문이 그대로 나가면 안 된다
+  assert.equal(await decryptEncString(posted.body.login.password, userKey), "hunter2");
+  assert.equal(await decryptEncString(posted.body.login.username, userKey), "me@example.test");
+
+  const afterSync = await send({ type: "GET_ITEMS" });
+  assert.ok(afterSync.items.some((i) => i.id === "created-1"));
+});
+
+test("SAVE_ITEM rejects a host that does not match the sender tab (spoofed host)", async () => {
+  seedSession([]);
+  const res = await send(
+    { type: "SAVE_ITEM", host: "victim.test", username: "me@example.test", password: "hunter2" },
+    contentScriptSender(3, "https://attacker.test/login")
+  );
+  assert.equal(res.ok, false);
 });

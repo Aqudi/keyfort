@@ -5,12 +5,16 @@ import {
   stretchKey,
   decryptSymmetricKey,
   decryptEncString,
+  encryptString,
   generateTotp,
 } from "./lib/crypto.js";
 import { VaultwardenClient } from "./lib/api.js";
+import { uriHostname, isSameSite } from "./lib/site.js";
 
 const AUTO_LOCK_MINUTES = 15;
 const AUTO_LOCK_ALARM = "auto-lock";
+const PENDING_SAVE_TTL_MS = 5 * 60 * 1000;
+const MAX_CAPTURED_FIELD_LENGTH = 1000; // 페이지에서 캡처한 값에 대한 방어적 상한
 
 // Bumped on every lock (LOCK message / auto-lock). In-flight writers capture it up front
 // and refuse to write if it changed, so a lock can never be undone by a stale write.
@@ -75,12 +79,25 @@ function bytesToB64(bytes) {
 
 // ---- core actions ------------------------------------------------------
 
-async function doLogin({ serverUrl, email, password }) {
+const TWO_FACTOR_AUTHENTICATOR = 0;
+
+async function doLogin({ serverUrl, email, password, twoFactorCode }) {
   const client = new VaultwardenClient(serverUrl);
   const { kdfIterations } = await client.prelogin(email);
   const masterKey = await deriveMasterKey(password, email, kdfIterations);
   const mpHash = await hashMasterKey(masterKey, password);
-  const loginData = await client.login(email, mpHash);
+  let loginData;
+  try {
+    const twoFactor = twoFactorCode ? { token: twoFactorCode, provider: TWO_FACTOR_AUTHENTICATOR } : undefined;
+    loginData = await client.login(email, mpHash, twoFactor);
+  } catch (err) {
+    if (!err.twoFactorRequired) throw err;
+    // ponytail: 인증 앱(TOTP) 코드만 지원. 이메일/YubiKey/WebAuthn은 필요해지면 추가.
+    if (!err.twoFactorProviders.includes(TWO_FACTOR_AUTHENTICATOR)) {
+      throw new Error(`지원하지 않는 2단계 인증 방식입니다 (provider: ${err.twoFactorProviders.join(", ")}). 인증 앱(TOTP)을 활성화하세요.`);
+    }
+    return { ok: false, twoFactorRequired: true };
+  }
   const stretched = await stretchKey(masterKey);
   const userKey = await decryptSymmetricKey(loginData.Key, stretched);
 
@@ -205,6 +222,97 @@ async function getItemSecrets(id) {
   }
 }
 
+// ---- 페이지 통합: 계정 자동 제안 + 새 로그인 저장 제안 ----------------------
+// 콘텐츠 스크립트(임의의 웹페이지)가 보내는 메시지는 host를 절대 그대로 믿지 않는다.
+// 항상 sender.tab.url에서 우리가 직접 다시 계산한다.
+
+// 같은 사용자 이름이 이미 저장돼 있으면 다시 묻지 않는다.
+// ponytail: 비밀번호가 바뀐 경우의 "업데이트" 제안은 범위 밖 — 필요해지면 추가.
+async function maybeQueuePendingSave(tabId, host, username, password) {
+  const session = await getSession();
+  if (!session) return; // 잠겨 있으면 비교/저장 둘 다 불가능하니 조용히 무시
+  const { items } = await getItemList();
+  const alreadySaved = items.some(
+    (item) => item.username === username && item.uris.some((u) => isSameSite(uriHostname(u), host))
+  );
+  if (alreadySaved) return;
+  // ponytail: 탭이 닫히면 항목이 남을 수 있다(5분 뒤 TTL로 무시됨). 탭 종료 리스너 정리는 필요해지면 추가.
+  await chrome.storage.session.set({
+    [`pendingSave:${tabId}`]: { host, username, password, createdAt: Date.now() },
+  });
+}
+
+async function takePendingSave(tabId, tabUrl) {
+  const key = `pendingSave:${tabId}`;
+  const { [key]: entry } = await chrome.storage.session.get([key]);
+  if (!entry) return null;
+  await chrome.storage.session.remove([key]); // 한 번 보여주면 끝 — 새로고침해도 다시 안 뜬다
+  if (Date.now() - entry.createdAt > PENDING_SAVE_TTL_MS) return null;
+  if (entry.host !== uriHostname(tabUrl)) return null; // 대기 중 다른 사이트로 이동함
+  return { host: entry.host, username: entry.username, password: entry.password };
+}
+
+async function saveItem({ host, username, password }) {
+  const epoch = lockEpoch;
+  const session = await getSession();
+  if (!session) throw new Error("Locked");
+  const userKey = userKeyFromSession(session);
+  const client = new VaultwardenClient(session.serverUrl);
+  const payload = {
+    type: 1,
+    name: await encryptString(host, userKey),
+    notes: null,
+    favorite: false,
+    folderId: null,
+    organizationId: null,
+    login: {
+      username: username ? await encryptString(username, userKey) : null,
+      password: await encryptString(password, userKey),
+      totp: null,
+      uris: [{ uri: await encryptString(`https://${host}`, userKey), match: null }],
+    },
+  };
+  const created = await client.createCipher(session.accessToken, payload);
+  const current = await getSession();
+  if (!current) throw new Error("Locked");
+  await updateSession({ ...current, ciphers: [...current.ciphers, created] }, epoch);
+}
+
+// 현재 탭 사이트와 일치하는 저장된 계정 목록(이름/사용자명만, 비밀번호 없음).
+async function getHostMatches(tabUrl) {
+  const host = uriHostname(tabUrl);
+  if (!host) return [];
+  if (!(await getSession())) return [];
+  const { items } = await getItemList();
+  return items
+    .filter((item) => item.uris.some((u) => isSameSite(uriHostname(u), host)))
+    .map(({ id, name, username, hasTotp }) => ({ id, name, username, hasTotp }));
+}
+
+// id로 지정한 항목의 비밀번호를 복호화해 해당 탭에 직접 채워 넣는다(+옵션으로 제출).
+// id는 클라이언트가 보낸 값이라도, 실제로 그 항목의 저장된 URI가 현재 탭 host와 일치하는지 여기서 다시 검증한다.
+async function requestAutofill(id, tab, submit) {
+  const session = await getSession();
+  if (!session) return { ok: false, error: "Locked" };
+  const host = uriHostname(tab.url);
+  if (!host) return { ok: false, error: "이 페이지에서는 자동입력할 수 없습니다." };
+  const userKey = userKeyFromSession(session);
+  const cipher = session.ciphers.find((c) => cipherField(c, "id", "Id") === id);
+  if (!cipher) return { ok: false, error: "항목을 찾을 수 없습니다." };
+  const summary = await decryptCipherSummary(cipher, userKey).catch(() => null);
+  if (!summary || !summary.uris.some((u) => isSameSite(uriHostname(u), host))) {
+    return { ok: false, error: "사이트가 일치하지 않습니다." };
+  }
+  const { password } = await getItemSecrets(id);
+  await chrome.tabs.sendMessage(tab.id, { type: "DO_AUTOFILL", username: summary.username, password, submit });
+  return { ok: true };
+}
+
+function isCapturedFieldValid(value, { required }) {
+  if (value == null) return !required;
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_CAPTURED_FIELD_LENGTH;
+}
+
 // ---- message router ------------------------------------------------------
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -220,8 +328,28 @@ function isExtensionPage(sender) {
   return typeof sender.url === "string" && sender.url.startsWith(chrome.runtime.getURL(""));
 }
 
+// content.js(모든 웹페이지에서 실행)가 보낼 수 있는 메시지는 이 목록으로 제한한다.
+// 각 핸들러는 클라이언트가 보낸 host/id를 그대로 믿지 않고 sender.tab.url로 다시 검증한다.
+const CONTENT_SCRIPT_MESSAGE_TYPES = new Set([
+  "GET_HOST_MATCHES",
+  "REQUEST_AUTOFILL",
+  "PENDING_SAVE",
+  "GET_PENDING_SAVE",
+  "SAVE_ITEM",
+]);
+
+function isAllowedSender(msg, sender) {
+  if (isExtensionPage(sender)) return true;
+  return (
+    sender.id === chrome.runtime.id &&
+    !!sender.tab &&
+    typeof sender.tab.url === "string" &&
+    CONTENT_SCRIPT_MESSAGE_TYPES.has(msg?.type)
+  );
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (!isExtensionPage(sender)) {
+  if (!isAllowedSender(msg, sender)) {
     sendResponse({ ok: false, error: "forbidden" });
     return false;
   }
@@ -261,6 +389,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case "GET_ITEM_SECRETS": {
           const secrets = await getItemSecrets(msg.id);
           sendResponse({ ok: true, ...secrets });
+          break;
+        }
+        case "GET_HOST_MATCHES": {
+          const items = await getHostMatches(sender.tab.url);
+          sendResponse({ ok: true, items });
+          break;
+        }
+        case "REQUEST_AUTOFILL": {
+          sendResponse(await requestAutofill(msg.id, sender.tab, !!msg.submit));
+          break;
+        }
+        case "PENDING_SAVE": {
+          const host = uriHostname(sender.tab.url);
+          if (host && isCapturedFieldValid(msg.password, { required: true }) && isCapturedFieldValid(msg.username, { required: false })) {
+            await maybeQueuePendingSave(sender.tab.id, host, msg.username || null, msg.password);
+          }
+          sendResponse({ ok: true });
+          break;
+        }
+        case "GET_PENDING_SAVE": {
+          const pending = await takePendingSave(sender.tab.id, sender.tab.url);
+          sendResponse({ ok: true, pending });
+          break;
+        }
+        case "SAVE_ITEM": {
+          if (uriHostname(sender.tab.url) !== msg.host) {
+            sendResponse({ ok: false, error: "사이트가 일치하지 않습니다." });
+            break;
+          }
+          await saveItem({ host: msg.host, username: msg.username, password: msg.password });
+          sendResponse({ ok: true });
           break;
         }
         default:
