@@ -55,7 +55,8 @@ export class VaultwardenClient {
   }
 
   // masterPasswordHashB64: base64 hash computed via hashMasterKey()
-  // twoFactor: { token, provider } — 서버가 2단계 인증을 요구할 때 두 번째 호출에서 넘긴다.
+  // twoFactor: { token, provider, remember } — 서버가 2단계 인증을 요구할 때 두 번째 호출에서 넘긴다.
+  // remember면 서버가 응답에 TwoFactorToken을 주고, 다음부터 provider 5(Remember)로 그 토큰을 내면 OTP를 건너뛴다.
   async login(email, masterPasswordHashB64, twoFactor) {
     const body = new URLSearchParams({
       grant_type: "password",
@@ -69,7 +70,7 @@ export class VaultwardenClient {
       ...(twoFactor && {
         twoFactorToken: twoFactor.token,
         twoFactorProvider: String(twoFactor.provider),
-        twoFactorRemember: "0",
+        twoFactorRemember: twoFactor.remember ? "1" : "0",
       }),
     });
     const res = await fetch(`${this.serverUrl}/identity/connect/token`, {

@@ -2,7 +2,7 @@
 // No network, no real secrets: all keys are random and generated per run.
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { encryptString, decryptEncString, bytesToB64 } from "../src/lib/crypto.js";
+import { encryptString, decryptEncString, bytesToB64, deriveMasterKey, stretchKey } from "../src/lib/crypto.js";
 
 // ---- chrome / fetch mocks (installed before background.js is imported) ----
 const store = { local: {}, session: {} };
@@ -47,8 +47,8 @@ globalThis.chrome = {
     onAlarm: { addListener: (fn) => (alarmListener = fn) },
   },
   tabs: {
-    async sendMessage(tabId, msg) {
-      tabMessages.push({ tabId, msg });
+    async sendMessage(tabId, msg, options) {
+      tabMessages.push({ tabId, msg, documentId: options?.documentId });
       return { ok: true };
     },
   },
@@ -113,7 +113,7 @@ beforeEach(() => {
   };
 });
 
-const contentScriptSender = (tabId, url) => ({ id: EXT_ID, tab: { id: tabId, url }, url });
+const contentScriptSender = (tabId, url, frame = { frameId: 0, documentId: "doc-top", url }) => ({ id: EXT_ID, tab: { id: tabId, url }, ...frame });
 
 // ---- tests ----
 test("LOCK during an in-flight SYNC does not resurrect the session", async () => {
@@ -323,8 +323,28 @@ test("REQUEST_AUTOFILL decrypts and relays DO_AUTOFILL to the requesting tab onl
   assert.equal(tabMessages.length, 1);
   assert.deepEqual(tabMessages[0], {
     tabId: 9,
-    msg: { type: "DO_AUTOFILL", username: "user-example", password: "pw", submit: true },
+    msg: { type: "DO_AUTOFILL", host: "example.test", username: "user-example", password: "pw", submit: true },
+    documentId: "doc-top",
   });
+});
+
+test("REQUEST_AUTOFILL from an iframe is checked against the frame's own url and sent only to that frame", async () => {
+  seedSession([await makeCipher("1", "example", userKey)]);
+
+  // 최상위 페이지는 일치하지만 요청한 iframe은 다른 출처 → 거부
+  const bad = await send(
+    { type: "REQUEST_AUTOFILL", id: "1" },
+    contentScriptSender(9, "https://example.test/login", { frameId: 3, documentId: "doc-3", url: "https://attacker.test/frame" })
+  );
+  assert.equal(bad.ok, false);
+  assert.equal(tabMessages.length, 0);
+
+  const good = await send(
+    { type: "REQUEST_AUTOFILL", id: "1" },
+    contentScriptSender(9, "https://portal.test/", { frameId: 4, documentId: "doc-4", url: "https://example.test/embed-login" })
+  );
+  assert.equal(good.ok, true);
+  assert.equal(tabMessages[0].documentId, "doc-4");
 });
 
 test("REQUEST_AUTOFILL refuses an item whose saved site does not match the current tab", async () => {
@@ -422,4 +442,188 @@ test("SAVE_ITEM rejects a host that does not match the sender tab (spoofed host)
     contentScriptSender(3, "https://attacker.test/login")
   );
   assert.equal(res.ok, false);
+});
+
+test("GET_HOST_MATCHES puts the most recently autofilled account first", async () => {
+  seedSession([await makeCipher("1", "example", userKey), await makeCipher("2", "example", userKey)]);
+  const sender = contentScriptSender(9, "https://example.test/login");
+
+  const before = await send({ type: "GET_HOST_MATCHES" }, sender);
+  assert.deepEqual(before.items.map((i) => i.id), ["1", "2"]);
+
+  await send({ type: "REQUEST_AUTOFILL", id: "2" }, sender);
+  const after = await send({ type: "GET_HOST_MATCHES" }, sender);
+  assert.deepEqual(after.items.map((i) => i.id), ["2", "1"]);
+  assert.equal(typeof after.items[0].lastUsedAt, "number");
+  assert.equal(after.items[1].lastUsedAt, null);
+});
+
+// 가짜 Vaultwarden: 2FA를 요구하고, twoFactorRemember=1이면 기억 토큰을 발급해 다음 로그인에서 받아준다.
+async function fakeTwoFactorServer({ email, password }) {
+  const iterations = 5000;
+  const stretched = await stretchKey(await deriveMasterKey(password, email, iterations));
+  // encryptString은 UTF-8 문자열을 받으므로 ASCII 범위 바이트로 64바이트 user key를 만든다.
+  const rawUserKey = String.fromCharCode(...crypto.getRandomValues(new Uint8Array(64)).map((b) => b & 0x7f));
+  const protectedKey = await encryptString(rawUserKey, stretched);
+  const tokenRequests = [];
+  fetchImpl = async (url, opts) => {
+    if (url.endsWith("/identity/accounts/prelogin")) return jsonResponse({ kdf: 0, kdfIterations: iterations });
+    if (url.endsWith("/api/sync?excludeDomains=true")) {
+      const bytes = new TextEncoder().encode(rawUserKey);
+      const userKey = { encKey: bytes.slice(0, 32), macKey: bytes.slice(32, 64) };
+      return jsonResponse({ ciphers: [await makeCipher("c1", "example", userKey)] });
+    }
+    const body = new URLSearchParams(opts.body);
+    tokenRequests.push(body);
+    const provider = body.get("twoFactorProvider");
+    const ok =
+      (provider === "0" && body.get("twoFactorToken") === "123456") ||
+      (provider === "5" && body.get("twoFactorToken") === "remember-me");
+    if (!ok) return jsonResponse({ error: "invalid_grant", TwoFactorProviders: ["0"] }, 400);
+    return jsonResponse({
+      access_token: "a",
+      refresh_token: "r",
+      expires_in: 3600,
+      Key: protectedKey,
+      ...(body.get("twoFactorRemember") === "1" && { TwoFactorToken: "remember-me" }),
+    });
+  };
+  return tokenRequests;
+}
+
+test("after one OTP login the device is remembered, so the next login skips the OTP", async () => {
+  const creds = { serverUrl: "https://vault.test", email: "me@example.test", password: "pw" };
+  const requests = await fakeTwoFactorServer(creds);
+
+  assert.deepEqual(await send({ type: "LOGIN", ...creds }), { ok: false, twoFactorRequired: true });
+  assert.equal((await send({ type: "LOGIN", ...creds, twoFactorCode: "123456" })).ok, true);
+  assert.equal(requests.at(-1).get("twoFactorRemember"), "1");
+
+  await send({ type: "LOCK" });
+  assert.equal((await send({ type: "LOGIN", ...creds })).ok, true);
+  assert.equal(requests.at(-1).get("twoFactorProvider"), "5");
+});
+
+test("a remembered 2FA token the server rejects is dropped and the OTP is asked again", async () => {
+  const creds = { serverUrl: "https://vault.test", email: "me@example.test", password: "pw" };
+  const requests = await fakeTwoFactorServer(creds);
+  const stretched = await stretchKey(await deriveMasterKey(creds.password, creds.email, 5000));
+  store.local.rememberedTwoFactor = { "https://vault.test|me@example.test": await encryptString("revoked", stretched) };
+
+  assert.deepEqual(await send({ type: "LOGIN", ...creds }), { ok: false, twoFactorRequired: true });
+  assert.equal(requests.at(-1).get("twoFactorProvider"), "5");
+  assert.deepEqual(store.local.rememberedTwoFactor, {});
+});
+
+async function loginWithOtp() {
+  const creds = { serverUrl: "https://vault.test", email: "me@example.test", password: "pw" };
+  const requests = await fakeTwoFactorServer(creds);
+  assert.equal((await send({ type: "LOGIN", ...creds, twoFactorCode: "123456" })).ok, true);
+  return { creds, requests };
+}
+
+const serverDown = () => {
+  fetchImpl = async () => {
+    throw new Error("offline");
+  };
+};
+
+test("LOCK keeps an encrypted local vault, so UNLOCK needs only the master password (no server, no OTP)", async () => {
+  await loginWithOtp();
+  const vault = store.local.vault;
+  assert.ok(vault.protectedKey.startsWith("2."));
+  assert.ok(vault.encRefreshToken.startsWith("2."), "refresh token must be stored encrypted");
+  assert.ok(!JSON.stringify(vault).includes('"r"'), "no plaintext refresh token on disk");
+
+  await send({ type: "LOCK" });
+  assert.equal((await send({ type: "GET_STATUS" })).locked, true);
+  assert.equal((await send({ type: "GET_STATUS" })).canUnlock, true);
+
+  serverDown();
+  assert.equal((await send({ type: "UNLOCK", password: "wrong" })).ok, false);
+  assert.equal((await send({ type: "UNLOCK", password: "pw" })).ok, true);
+  const items = await send({ type: "GET_ITEMS" });
+  assert.deepEqual(items.items.map((i) => i.id), ["c1"]);
+});
+
+test("PIN unlocks after LOCK, and five wrong PINs disable it", async () => {
+  await loginWithOtp();
+  assert.equal((await send({ type: "SET_PIN", pin: "12" })).ok, false);
+  assert.equal((await send({ type: "SET_PIN", pin: "2468" })).ok, true);
+  assert.ok(store.session.pin, "PIN-wrapped key lives in session (memory) storage only");
+  assert.equal(store.local.pin, undefined);
+
+  await send({ type: "LOCK" });
+  serverDown();
+  assert.equal((await send({ type: "GET_STATUS" })).pinEnabled, true);
+  assert.equal((await send({ type: "UNLOCK_PIN", pin: "2468" })).ok, true);
+
+  await send({ type: "LOCK" });
+  for (let i = 0; i < 4; i++) assert.equal((await send({ type: "UNLOCK_PIN", pin: "0000" })).pinDisabled, undefined);
+  const last = await send({ type: "UNLOCK_PIN", pin: "0000" });
+  assert.equal(last.pinDisabled, true);
+  assert.equal((await send({ type: "GET_STATUS" })).pinEnabled, false);
+  assert.equal((await send({ type: "UNLOCK_PIN", pin: "2468" })).ok, false);
+});
+
+test("LOGOUT forgets the local vault and PIN", async () => {
+  await loginWithOtp();
+  await send({ type: "SET_PIN", pin: "2468" });
+  await send({ type: "LOGOUT" });
+  const status = await send({ type: "GET_STATUS" });
+  assert.equal(status.locked, true);
+  assert.equal(status.canUnlock, false);
+  assert.equal(store.local.vault, undefined);
+  assert.equal(store.session.pin, undefined);
+});
+
+test("auto-lock timer follows the chosen minutes and is not extended by merely opening login pages", async () => {
+  seedSession([await makeCipher("1", "example", userKey)]);
+  const page = contentScriptSender(9, "https://example.test/login");
+  const settle = () => new Promise((r) => setTimeout(r, 20));
+
+  await send({ type: "GET_HOST_MATCHES" }, page);
+  await settle();
+  assert.equal(alarms["auto-lock"], undefined);
+
+  await send({ type: "REQUEST_AUTOFILL", id: "1" }, page);
+  await settle();
+  assert.deepEqual(alarms["auto-lock"], { delayInMinutes: 15 });
+
+  assert.equal((await send({ type: "SET_LOCK_MINUTES", minutes: 7 })).ok, false);
+  await send({ type: "SET_LOCK_MINUTES", minutes: 60 });
+  await settle();
+  assert.deepEqual(alarms["auto-lock"], { delayInMinutes: 60 });
+
+  await send({ type: "SET_LOCK_MINUTES", minutes: 0 });
+  await settle();
+  assert.equal(alarms["auto-lock"], undefined);
+});
+
+test("concurrent wrong PINs are counted one by one, so the attempt limit cannot be raced", async () => {
+  await loginWithOtp();
+  await send({ type: "SET_PIN", pin: "2468" });
+  await send({ type: "LOCK" });
+  serverDown();
+  const results = await Promise.all(Array.from({ length: 8 }, () => send({ type: "UNLOCK_PIN", pin: "0000" })));
+  assert.equal(results.filter((r) => r.pinDisabled).length, 1);
+  assert.equal(store.session.pin, undefined, "a late failure must not resurrect the wiped PIN");
+  assert.equal((await send({ type: "UNLOCK_PIN", pin: "2468" })).ok, false);
+});
+
+test("an iframe on another host cannot consume the top page's pending save offer", async () => {
+  seedSession([]);
+  await send({ type: "PENDING_SAVE", username: "u", password: "p" }, contentScriptSender(9, "https://example.test/"));
+  const ad = await send({ type: "GET_PENDING_SAVE" }, contentScriptSender(9, "https://example.test/", { frameId: 2, documentId: "ad", url: "https://ads.test/x" }));
+  assert.equal(ad.pending, null);
+  const top = await send({ type: "GET_PENDING_SAVE" }, contentScriptSender(9, "https://example.test/"));
+  assert.equal(top.pending.username, "u");
+});
+
+test("the remembered 2FA token is stored encrypted, not in plaintext", async () => {
+  await loginWithOtp();
+  const stored = Object.values(store.local.rememberedTwoFactor);
+  assert.equal(stored.length, 1);
+  assert.ok(stored[0].startsWith("2."));
+  assert.notEqual(stored[0], "remember-me");
 });

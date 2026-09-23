@@ -99,6 +99,16 @@ test("login sends the authenticator code as twoFactorToken/twoFactorProvider", a
   assert.equal(sentBody.get("twoFactorRemember"), "0");
 });
 
+test("login asks the server to remember this device when twoFactor.remember is set", async () => {
+  let sentBody;
+  fetchImpl = async (_url, opts) => {
+    sentBody = new URLSearchParams(opts.body);
+    return jsonResponse({ access_token: "a", refresh_token: "r" });
+  };
+  await new VaultwardenClient("https://vault.test").login("user@example.test", "hash", { token: "123456", provider: 0, remember: true });
+  assert.equal(sentBody.get("twoFactorRemember"), "1");
+});
+
 test("createCipher posts the cipher and returns the created resource", async () => {
   let sentUrl, sentOpts;
   fetchImpl = async (url, opts) => {
