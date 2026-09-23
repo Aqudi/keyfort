@@ -378,6 +378,11 @@ async function renderSettings() {
         ${status.pinEnabled ? '<button class="link-btn danger" id="removePin">PIN 해제</button>' : ""}
       </section>
       <section class="settings-card">
+        <div class="settings-title">가져오기</div>
+        <div class="settings-desc">Chrome, Arc, Edge, Brave, 1Password에서 내보낸 CSV를 가져옵니다.</div>
+        <button class="btn btn-secondary" id="importBtn">가져오기 열기</button>
+      </section>
+      <section class="settings-card">
         <div class="settings-title">계정</div>
         <div class="settings-desc">${escapeHtml(status.email)}</div>
         <button class="btn btn-secondary" id="logoutBtn">로그아웃</button>
@@ -411,6 +416,8 @@ async function renderSettings() {
     await send({ type: "LOGOUT" });
     renderLogin(status);
   });
+  // 파일 선택창을 열면 팝업이 그대로 닫혀버려서(MV3 제약), 옵션 탭에서 진행한다.
+  document.getElementById("importBtn").addEventListener("click", () => chrome.runtime.openOptionsPage());
 }
 
 async function renderVault() {
@@ -629,7 +636,7 @@ async function renderItemDetail(id, allItems) {
   document.getElementById("copyPassword").addEventListener("click", () => copyToClipboard(res.password || "", "비밀번호"));
   document.getElementById("copyTotp")?.addEventListener("click", () => copyToClipboard(currentTotp, "인증 코드"));
 
-  document.getElementById("autofillBtn").addEventListener("click", () => autofillActiveTab(item, res.password));
+  document.getElementById("autofillBtn").addEventListener("click", () => autofillActiveTab(item, res.password, currentTotp));
 
   // live-refresh TOTP countdown
   if (res.totp) {
@@ -640,7 +647,7 @@ async function renderItemDetail(id, allItems) {
   }
 }
 
-async function autofillActiveTab(item, password) {
+async function autofillActiveTab(item, password, totp) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return;
 
@@ -657,6 +664,7 @@ async function autofillActiveTab(item, password) {
       host: tabHost, // 확인 후 탭이 다른 사이트로 이동했으면 content.js가 거부한다
       username: item.username,
       password,
+      totp: totp || null, // OTP 입력칸이 지금 이 탭에 있으면 채워진다(없으면 content.js가 무시)
     }, { frameId: 0 }); // 최상위 프레임만 — all_frames라 다른 출처 iframe에 비밀번호가 새지 않게
     if (!reply?.ok) {
       showToast(reply?.error || "자동입력에 실패했습니다.", ERROR_TOAST_MS);

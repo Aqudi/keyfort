@@ -129,6 +129,20 @@ export class VaultwardenClient {
     return data;
   }
 
+  // cipher: createCipher와 같은 형태의 전체 바디(부분 patch가 아님 — Vaultwarden PUT은 전체 교체).
+  async updateCipher(accessToken, id, cipher) {
+    const res = await fetch(`${this.serverUrl}/api/ciphers/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify(cipher),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.Message || data.message || `update cipher failed: ${res.status}`);
+    }
+    return data;
+  }
+
   async deleteCipher(accessToken, id) {
     const res = await fetch(`${this.serverUrl}/api/ciphers/${encodeURIComponent(id)}`, {
       method: "DELETE",

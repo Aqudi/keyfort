@@ -60,6 +60,21 @@ function findLoginFields() {
   return usernameInput ? { usernameInput, passwordInput: null } : null;
 }
 
+const OTP_HINT = /otp|onetime|one-time|2fa|mfa|totp|verification.?code|security.?code|auth.?code|인증\s*(코드|번호)|보안\s*코드/i;
+
+function looksLikeOtpField(el) {
+  const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
+  if (ac.includes("one-time-code")) return true;
+  return OTP_HINT.test(`${el.name} ${el.id} ${el.placeholder} ${el.getAttribute("aria-label") || ""}`);
+}
+
+// 비밀번호 단계 뒤에 별도 페이지/단계로 뜨는 2FA 입력칸. findLoginFields()가 아무것도 못 찾았을 때만
+// (= 로그인 폼이 아닌 페이지) 찾는다 — 그래야 이메일/비밀번호 칸을 OTP로 오인하지 않는다.
+function findOtpField() {
+  const inputs = deepQueryAll('input[type="text"], input[type="tel"], input[type="number"], input:not([type])').filter(isVisible);
+  return inputs.find(looksLikeOtpField) || null;
+}
+
 // React/Vue 등은 value setter를 가로채므로 프로토타입 setter로 넣고, 실제 타이핑처럼 이벤트를 흘린다.
 function fillInput(input, value) {
   input.focus();
@@ -94,9 +109,10 @@ function submitFrom(input) {
   input.dispatchEvent(new KeyboardEvent("keyup", opts));
 }
 
-// 다단계 로그인(이메일 → 비밀번호)에서 이메일 단계를 채운 항목. 비밀번호 칸이 나타나면 이어서 채운다.
-// ponytail: 메모리에만 있어서 두 단계 사이에 전체 페이지 이동이 있으면 이어지지 않는다(Google은 SPA라 괜찮음).
+// 다단계 로그인(이메일 → 비밀번호[ → OTP])에서 앞 단계를 채운 항목과, 다음에 기다리는 단계.
+// ponytail: 메모리에만 있어서 단계 사이에 전체 페이지 이동이 있으면 이어지지 않는다(SPA라면 괜찮음).
 let pendingFillId = null;
+let pendingFillStep = null; // "password" | "otp"
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "DO_AUTOFILL") {
@@ -106,14 +122,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
     const fields = findLoginFields();
-    if (!fields) {
+    const otpField = fields ? null : findOtpField();
+    if (!fields && !otpField) {
       sendResponse({ ok: false, error: "로그인 폼을 찾지 못했습니다." });
       return;
     }
-    if (fields.usernameInput && msg.username) fillInput(fields.usernameInput, msg.username);
-    if (fields.passwordInput && msg.password) fillInput(fields.passwordInput, msg.password);
-    if (msg.submit) submitFrom(fields.passwordInput || fields.usernameInput);
-    sendResponse({ ok: true, step: fields.passwordInput ? "password" : "username" });
+    if (fields?.usernameInput && msg.username) fillInput(fields.usernameInput, msg.username);
+    if (fields?.passwordInput && msg.password) fillInput(fields.passwordInput, msg.password);
+    if (otpField && msg.totp) fillInput(otpField, msg.totp);
+    const target = otpField || fields?.passwordInput || fields?.usernameInput;
+    if (msg.submit && target) submitFrom(target);
+    sendResponse({ ok: true, step: otpField ? "otp" : fields?.passwordInput ? "password" : "username" });
   }
   return true;
 });
@@ -262,6 +281,45 @@ function showSaveBanner({ host, username, password }) {
   });
 }
 
+// 2FA 설정 페이지 대부분이 "스캔 안 되나요?" 링크에 otpauth:// URI를 그대로 심어 둔다. QR 이미지 자체를
+// 디코딩하는 건 훨씬 비싸서(카메라/이미지 라이브러리) 스킵 — 필요해지면 추가.
+// ponytail: href만 보므로, 보이지 않는 곳에 예시로 박아둔 otpauth 링크도 오탐될 수 있다.
+function findOtpauthLink() {
+  return deepQueryAll('a[href^="otpauth://"]')[0]?.href || null;
+}
+
+function showTotpBanner(otpauth) {
+  const el = mountCard(`
+    <div class="m-msg">이 사이트의 OTP(2단계 인증)를 저장할까요?</div>
+    <div class="m-row">
+      <button class="m-secondary" data-act="dismiss">무시</button>
+      <button class="m-primary" data-act="save">저장</button>
+    </div>`);
+  el.querySelector('[data-act="dismiss"]').addEventListener("click", () => el.remove());
+  el.querySelector('[data-act="save"]').addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    const res = await send({ type: "SAVE_TOTP", host: location.hostname, otpauth });
+    if (res?.ok) {
+      el.querySelector(".m-msg").textContent = "저장했습니다";
+      el.querySelector(".m-row").remove();
+      setTimeout(() => el.remove(), 1200);
+    } else {
+      el.querySelector(".m-msg").textContent = res?.error || "저장하지 못했습니다.";
+      e.target.disabled = false;
+    }
+  });
+}
+
+let lastOtpauthShown = null;
+async function checkOtpauth() {
+  const uri = findOtpauthLink();
+  if (!uri || uri === lastOtpauthShown) return;
+  const matchRes = await send({ type: "GET_HOST_MATCHES" });
+  if (!matchRes?.ok || !matchRes.items.some((i) => !i.hasTotp)) return; // 잠겨 있거나, 저장할 계정이 없거나, 이미 있음
+  lastOtpauthShown = uri;
+  showTotpBanner(uri);
+}
+
 const relTime = new Intl.RelativeTimeFormat("ko", { numeric: "auto" });
 function timeAgo(ts) {
   const sec = (ts - Date.now()) / 1000;
@@ -305,8 +363,16 @@ function showAccountPicker(items) {
       if (res?.ok) {
         clearOverlay();
         overlayShown = false;
-        // 이메일만 채운 단계면, 다음 화면에 비밀번호 칸이 뜰 때 같은 항목으로 이어서 채운다.
-        if (!findLoginFields()?.passwordInput) pendingFillId = item.id;
+        // 이메일만 채운 단계면 다음 화면(비밀번호)을, 비밀번호까지 채웠고 이 계정에 TOTP가 있으면
+        // 다음 화면(OTP)을 기다린다.
+        const after = findLoginFields();
+        if (!after?.passwordInput) {
+          pendingFillId = item.id;
+          pendingFillStep = "password";
+        } else if (res.hasTotp) {
+          pendingFillId = item.id;
+          pendingFillStep = "otp";
+        }
       } else {
         btn.disabled = false;
         btn.querySelector(".m-text").insertAdjacentHTML("beforeend", `<div class="m-user">${escapeHtml(res?.error || "자동입력 실패")}</div>`);
@@ -318,13 +384,20 @@ function showAccountPicker(items) {
 let overlayShown = false;
 let lastUsername = null; // 이메일 단계에서 입력한 값 — 다음 단계의 비밀번호와 묶어 저장 제안에 쓴다
 
+function consumePendingFill() {
+  const id = pendingFillId;
+  pendingFillId = null;
+  pendingFillStep = null;
+  send({ type: "REQUEST_AUTOFILL", id, submit: true }).catch(() => {});
+}
+
 async function checkPage() {
   const fields = findLoginFields();
-  if (fields?.passwordInput && pendingFillId) {
-    const id = pendingFillId;
-    pendingFillId = null;
-    send({ type: "REQUEST_AUTOFILL", id, submit: true }).catch(() => {});
-    return;
+  if (pendingFillId) {
+    // 비밀번호 단계를 기다리는 중엔 반드시 "새로 나타난" passwordInput이어야 한다 — 지금 막 채운
+    // 바로 그 페이지에서 다시 안 채우도록, 대기 단계와 실제 나타난 필드가 맞을 때만 소비한다.
+    if (pendingFillStep === "password" && fields?.passwordInput) return consumePendingFill();
+    if (pendingFillStep === "otp" && !fields && findOtpField()) return consumePendingFill();
   }
   if (!fields || overlayShown) return;
   overlayShown = true;
@@ -347,6 +420,7 @@ function scheduleCheck() {
   scanTimer = setTimeout(() => {
     scanTimer = null;
     checkPage().catch(() => {});
+    checkOtpauth().catch(() => {});
   }, 300);
 }
 
@@ -378,3 +452,4 @@ for (const type of ["submit", "click", "keydown"]) document.addEventListener(typ
 document.addEventListener("focusin", scheduleCheck, true);
 domObserver.observe(document.documentElement, { childList: true, subtree: true });
 checkPage().catch(() => {});
+checkOtpauth().catch(() => {});

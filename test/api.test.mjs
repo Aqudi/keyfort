@@ -133,6 +133,27 @@ test("createCipher throws the server's error message on failure", async () => {
   );
 });
 
+test("updateCipher puts the cipher to its id and returns the updated resource", async () => {
+  let sentUrl, sentOpts;
+  fetchImpl = async (url, opts) => {
+    sentUrl = url;
+    sentOpts = opts;
+    return jsonResponse({ id: "abc 123", type: 1 });
+  };
+  const cipher = { type: 1, name: "enc-name" };
+  const result = await new VaultwardenClient("https://vault.test").updateCipher("tok", "abc 123", cipher);
+  assert.equal(sentUrl, "https://vault.test/api/ciphers/abc%20123");
+  assert.equal(sentOpts.method, "PUT");
+  assert.equal(sentOpts.headers.authorization, "Bearer tok");
+  assert.deepEqual(JSON.parse(sentOpts.body), cipher);
+  assert.deepEqual(result, { id: "abc 123", type: 1 });
+});
+
+test("updateCipher throws the server's error message on failure", async () => {
+  fetchImpl = async () => jsonResponse({ Message: "bad cipher" }, 400);
+  await assert.rejects(new VaultwardenClient("https://vault.test").updateCipher("tok", "1", {}), /bad cipher/);
+});
+
 test("deleteCipher sends a DELETE to the cipher's id", async () => {
   let sentUrl, sentOpts;
   fetchImpl = async (url, opts) => {

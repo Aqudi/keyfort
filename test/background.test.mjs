@@ -320,12 +320,25 @@ test("REQUEST_AUTOFILL decrypts and relays DO_AUTOFILL to the requesting tab onl
   const res = await send({ type: "REQUEST_AUTOFILL", id: "1", submit: true }, contentScriptSender(9, "https://example.test/login"));
 
   assert.equal(res.ok, true);
+  assert.equal(res.hasTotp, false);
   assert.equal(tabMessages.length, 1);
   assert.deepEqual(tabMessages[0], {
     tabId: 9,
-    msg: { type: "DO_AUTOFILL", host: "example.test", username: "user-example", password: "pw", submit: true },
+    msg: { type: "DO_AUTOFILL", host: "example.test", username: "user-example", password: "pw", totp: null, submit: true },
     documentId: "doc-top",
   });
+});
+
+test("REQUEST_AUTOFILL includes the current TOTP code and reports hasTotp when the item has a seed", async () => {
+  const cipher = await makeCipher("1", "example", userKey);
+  cipher.login.totp = await encryptString("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", userKey);
+  seedSession([cipher]);
+
+  const res = await send({ type: "REQUEST_AUTOFILL", id: "1" }, contentScriptSender(9, "https://example.test/login"));
+
+  assert.equal(res.ok, true);
+  assert.equal(res.hasTotp, true);
+  assert.match(tabMessages[0].msg.totp, /^\d{6}$/);
 });
 
 test("REQUEST_AUTOFILL from an iframe is checked against the frame's own url and sent only to that frame", async () => {
@@ -442,6 +455,122 @@ test("SAVE_ITEM rejects a host that does not match the sender tab (spoofed host)
     contentScriptSender(3, "https://attacker.test/login")
   );
   assert.equal(res.ok, false);
+});
+
+const OTPAUTH_URI = "otpauth://totp/example.test:me?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=example.test";
+
+test("SAVE_TOTP attaches the otpauth secret to the matching saved item", async () => {
+  const cipher = await makeCipher("1", "example", userKey); // uris: https://example.test, no totp yet
+  seedSession([cipher]);
+  let posted;
+  fetchImpl = async (url, opts) => {
+    posted = { url, method: opts.method, body: JSON.parse(opts.body) };
+    return jsonResponse({ id: "1", type: 1, ...posted.body });
+  };
+
+  const res = await send(
+    { type: "SAVE_TOTP", host: "example.test", otpauth: OTPAUTH_URI },
+    contentScriptSender(3, "https://example.test/2fa-setup")
+  );
+
+  assert.equal(res.ok, true);
+  assert.equal(posted.url, "https://vault.test/api/ciphers/1");
+  assert.equal(posted.method, "PUT");
+  assert.equal(await decryptEncString(posted.body.login.totp, userKey), OTPAUTH_URI);
+  // 기존 아이디/비번은 그대로 유지된다 (재암호화하지 않음)
+  assert.deepEqual(posted.body.login.password, cipher.login.password);
+
+  const secrets = await send({ type: "GET_ITEM_SECRETS", id: "1" });
+  assert.match(secrets.totp.code, /^\d{6}$/);
+});
+
+test("SAVE_TOTP rejects a malformed otpauth value", async () => {
+  seedSession([await makeCipher("1", "example", userKey)]);
+  const res = await send(
+    { type: "SAVE_TOTP", host: "example.test", otpauth: "javascript:alert(1)" },
+    contentScriptSender(3, "https://example.test/2fa-setup")
+  );
+  assert.equal(res.ok, false);
+});
+
+test("SAVE_TOTP rejects a host that does not match the sender tab", async () => {
+  seedSession([await makeCipher("1", "example", userKey)]);
+  const res = await send(
+    { type: "SAVE_TOTP", host: "example.test", otpauth: OTPAUTH_URI },
+    contentScriptSender(3, "https://attacker.test/2fa-setup")
+  );
+  assert.equal(res.ok, false);
+});
+
+test("SAVE_TOTP refuses when no saved item matches the site", async () => {
+  seedSession([]);
+  const res = await send(
+    { type: "SAVE_TOTP", host: "example.test", otpauth: OTPAUTH_URI },
+    contentScriptSender(3, "https://example.test/2fa-setup")
+  );
+  assert.equal(res.ok, false);
+  assert.match(res.error, /없습니다/);
+});
+
+test("SAVE_TOTP refuses when two saved items match the site (can't tell which one)", async () => {
+  seedSession([await makeCipher("1", "example", userKey), await makeCipher("2", "example", userKey)]);
+  const res = await send(
+    { type: "SAVE_TOTP", host: "example.test", otpauth: OTPAUTH_URI },
+    contentScriptSender(3, "https://example.test/2fa-setup")
+  );
+  assert.equal(res.ok, false);
+  assert.match(res.error, /특정할 수 없습니다/);
+});
+
+test("IMPORT_ITEMS creates new items and skips ones already saved for the same site+username", async () => {
+  seedSession([await makeCipher("1", "example", userKey)]); // username: user-example, uri: https://example.test
+  const posted = [];
+  fetchImpl = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    posted.push(body);
+    return jsonResponse({ id: `new-${posted.length}`, type: 1, ...body });
+  };
+
+  const res = await send({
+    type: "IMPORT_ITEMS",
+    entries: [
+      { name: "Example", url: "https://example.test", username: "user-example", password: "dup", notes: "", otpauth: "" }, // already saved
+      { name: "NewSite", url: "https://newsite.test", username: "me", password: "hunter2", notes: "n", otpauth: "" },
+    ],
+  });
+
+  assert.deepEqual(res, { ok: true, imported: 1, skipped: 1, failed: 0 });
+  assert.equal(posted.length, 1);
+  assert.equal(await decryptEncString(posted[0].login.password, userKey), "hunter2");
+
+  const items = await send({ type: "GET_ITEMS" });
+  assert.ok(items.items.some((i) => i.name === "NewSite"));
+});
+
+test("IMPORT_ITEMS counts entries whose url can't be parsed as failed instead of throwing", async () => {
+  seedSession([]);
+  const res = await send({ type: "IMPORT_ITEMS", entries: [{ url: "", password: "pw" }] });
+  assert.deepEqual(res, { ok: true, imported: 0, skipped: 0, failed: 1 });
+});
+
+test("IMPORT_ITEMS rejects an empty or oversized entry list", async () => {
+  seedSession([]);
+  assert.equal((await send({ type: "IMPORT_ITEMS", entries: [] })).ok, false);
+  assert.equal((await send({ type: "IMPORT_ITEMS", entries: new Array(2001).fill({ url: "https://a.test", password: "p" }) })).ok, false);
+});
+
+test("IMPORT_ITEMS fails while locked instead of throwing", async () => {
+  const res = await send({ type: "IMPORT_ITEMS", entries: [{ url: "https://a.test", password: "p" }] });
+  assert.deepEqual(res, { ok: false, error: "Locked" });
+});
+
+test("a content script may not send IMPORT_ITEMS (extension-page only)", async () => {
+  seedSession([]);
+  const res = await send(
+    { type: "IMPORT_ITEMS", entries: [{ url: "https://a.test", password: "p" }] },
+    contentScriptSender(1, "https://evil.test/page")
+  );
+  assert.deepEqual(res, { ok: false, error: "forbidden" });
 });
 
 test("GET_HOST_MATCHES puts the most recently autofilled account first", async () => {

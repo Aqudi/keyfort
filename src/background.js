@@ -433,6 +433,61 @@ async function saveItem({ host, username, password }) {
   await updateSession({ ...current, ciphers: [...current.ciphers, created] }, epoch);
 }
 
+const MAX_IMPORT_ENTRIES = 2000;
+
+// Chrome/Arc/Edge/Brave나 1Password에서 내보낸 CSV를 통째로 가져온다. 이미 같은 아이디+사이트로
+// 저장된 항목은 조용히 건너뛴다(중복 정리) — 1Password류의 "그냥 가져오기"에 맞춰 미리보기는 없다.
+async function importItems(entries) {
+  const epoch = lockEpoch;
+  const session = await getSession();
+  if (!session) throw new Error("Locked");
+  const { items: existing } = await getItemList();
+  const alreadySaved = (username, host) =>
+    existing.some((item) => item.username === username && item.uris.some((u) => isSameSite(uriHostname(u), host)));
+
+  const userKey = userKeyFromSession(session);
+  const client = new VaultwardenClient(session.serverUrl);
+  const created = [];
+  let skipped = 0;
+  let failed = 0;
+  for (const entry of entries) {
+    const host = uriHostname(entry.url);
+    if (!host) {
+      failed += 1;
+      continue;
+    }
+    if (alreadySaved(entry.username || null, host)) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      const payload = {
+        type: 1,
+        name: await encryptString(entry.name || host, userKey),
+        notes: entry.notes ? await encryptString(entry.notes, userKey) : null,
+        favorite: false,
+        folderId: null,
+        organizationId: null,
+        login: {
+          username: entry.username ? await encryptString(entry.username, userKey) : null,
+          password: await encryptString(entry.password, userKey),
+          totp: entry.otpauth ? await encryptString(entry.otpauth, userKey) : null,
+          uris: [{ uri: await encryptString(entry.url, userKey), match: null }],
+        },
+      };
+      created.push(await client.createCipher(session.accessToken, payload));
+    } catch {
+      failed += 1;
+    }
+  }
+  if (created.length) {
+    const current = await getSession();
+    if (!current) throw new Error("Locked");
+    await updateSession({ ...current, ciphers: [...current.ciphers, ...created] }, epoch);
+  }
+  return { imported: created.length, skipped, failed };
+}
+
 // 현재 탭 사이트와 일치하는 저장된 계정 목록(이름/사용자명만, 비밀번호 없음).
 async function getHostMatches(tabUrl) {
   const host = uriHostname(tabUrl);
@@ -466,12 +521,66 @@ async function requestAutofill(id, tab, frameUrl, documentId, submit) {
   if (!summary || !summary.uris.some((u) => isSameSite(uriHostname(u), host))) {
     return { ok: false, error: "사이트가 일치하지 않습니다." };
   }
-  const { password } = await getItemSecrets(id);
+  const { password, totp } = await getItemSecrets(id);
   // documentId로 보내야 검증 후 프레임이 다른 페이지로 이동했을 때 새 문서가 비밀번호를 받지 않는다.
-  // content.js도 host를 한 번 더 확인한다.
-  await chrome.tabs.sendMessage(tab.id, { type: "DO_AUTOFILL", host, username: summary.username, password, submit }, { documentId });
+  // content.js도 host를 한 번 더 확인한다. totp는 이 시점의 코드일 뿐이라 OTP 칸이 없는 페이지면 그냥 버려진다.
+  await chrome.tabs.sendMessage(
+    tab.id,
+    { type: "DO_AUTOFILL", host, username: summary.username, password, totp: totp?.code ?? null, submit },
+    { documentId }
+  );
   await markUsed(id);
-  return { ok: true };
+  return { ok: true, hasTotp: summary.hasTotp };
+}
+
+// otpauth://totp/... 형태만 받는다(HOTP는 카운터 기반이라 generateTotp가 처리 못 함).
+function isValidOtpauthUri(value) {
+  if (typeof value !== "string" || value.length > 2000) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "otpauth:" && url.host.toLowerCase() === "totp" && !!url.searchParams.get("secret");
+  } catch {
+    return false;
+  }
+}
+
+// 2FA 설정 페이지가 보여준 otpauth:// 시크릿을, 이 사이트에 이미 저장된(그리고 아직 TOTP가 없는) 계정에 붙인다.
+// ponytail: 같은 사이트에 TOTP 없는 계정이 둘 이상이면 어느 것인지 알 수 없어 거부한다 — 필요해지면 선택 UI 추가.
+async function saveTotpForHost(host, otpauthUri) {
+  const epoch = lockEpoch;
+  const session = await getSession();
+  if (!session) throw new Error("Locked");
+  const { items } = await getItemList();
+  const matches = items.filter((item) => !item.hasTotp && item.uris.some((u) => isSameSite(uriHostname(u), host)));
+  if (matches.length === 0) throw new Error("이 사이트에 저장된 계정이 없습니다.");
+  if (matches.length > 1) throw new Error("저장할 계정을 하나로 특정할 수 없습니다.");
+  const target = matches[0];
+  const cipher = session.ciphers.find((c) => cipherField(c, "id", "Id") === target.id);
+  if (!cipher) throw new Error("항목을 찾을 수 없습니다.");
+  const userKey = userKeyFromSession(session);
+  const login = cipherField(cipher, "login", "Login");
+  const payload = {
+    type: 1,
+    name: cipherField(cipher, "name", "Name"),
+    notes: cipherField(cipher, "notes", "Notes") ?? null,
+    favorite: cipherField(cipher, "favorite", "Favorite") ?? false,
+    folderId: cipherField(cipher, "folderId", "FolderId") ?? null,
+    organizationId: cipherField(cipher, "organizationId", "OrganizationId") ?? null,
+    login: {
+      username: cipherField(login, "username", "Username") ?? null,
+      password: cipherField(login, "password", "Password") ?? null,
+      totp: await encryptString(otpauthUri, userKey),
+      uris: cipherField(login, "uris", "Uris") ?? [],
+    },
+  };
+  const client = new VaultwardenClient(session.serverUrl);
+  const updated = await client.updateCipher(session.accessToken, target.id, payload);
+  const current = await getSession();
+  if (!current) throw new Error("Locked");
+  await updateSession(
+    { ...current, ciphers: current.ciphers.map((c) => (cipherField(c, "id", "Id") === target.id ? updated : c)) },
+    epoch
+  );
 }
 
 function isCapturedFieldValid(value, { required }) {
@@ -502,9 +611,10 @@ const CONTENT_SCRIPT_MESSAGE_TYPES = new Set([
   "PENDING_SAVE",
   "GET_PENDING_SAVE",
   "SAVE_ITEM",
+  "SAVE_TOTP",
 ]);
 
-const USER_ACTION_MESSAGE_TYPES = new Set(["REQUEST_AUTOFILL", "SAVE_ITEM"]);
+const USER_ACTION_MESSAGE_TYPES = new Set(["REQUEST_AUTOFILL", "SAVE_ITEM", "SAVE_TOTP"]);
 
 function isAllowedSender(msg, sender) {
   if (isExtensionPage(sender)) return true;
@@ -627,6 +737,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             break;
           }
           await saveItem({ host: msg.host, username: msg.username, password: msg.password });
+          sendResponse({ ok: true });
+          break;
+        }
+        case "IMPORT_ITEMS": {
+          if (!Array.isArray(msg.entries) || msg.entries.length === 0 || msg.entries.length > MAX_IMPORT_ENTRIES) {
+            sendResponse({ ok: false, error: "가져올 항목이 없습니다." });
+            break;
+          }
+          sendResponse({ ok: true, ...(await importItems(msg.entries)) });
+          break;
+        }
+        case "SAVE_TOTP": {
+          if (uriHostname(frameUrl) !== msg.host || !isValidOtpauthUri(msg.otpauth)) {
+            sendResponse({ ok: false, error: "잘못된 요청입니다." });
+            break;
+          }
+          await saveTotpForHost(msg.host, msg.otpauth);
           sendResponse({ ok: true });
           break;
         }
