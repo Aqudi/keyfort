@@ -115,6 +115,20 @@ export class VaultwardenClient {
     return res.json();
   }
 
+  // name: 이미 암호화된(EncString) 폴더 이름.
+  async createFolder(accessToken, name) {
+    const res = await fetch(`${this.serverUrl}/api/folders`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.Message || data.message || `create folder failed: ${res.status}`);
+    }
+    return data;
+  }
+
   // cipher: 이미 암호화된(EncString) 필드로 구성된 Bitwarden Cipher 요청 바디.
   async createCipher(accessToken, cipher) {
     const res = await fetch(`${this.serverUrl}/api/ciphers`, {

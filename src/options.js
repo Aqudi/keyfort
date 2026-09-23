@@ -5,6 +5,8 @@ import { normalizeImportRows } from "./lib/importers.js";
 document.getElementById("brand").innerHTML = brandHtml();
 
 const fileInput = document.getElementById("importFile");
+const folderSelect = document.getElementById("importFolder");
+const newFolderInput = document.getElementById("importNewFolder");
 const importBtn = document.getElementById("importBtn");
 const statusEl = document.getElementById("importStatus");
 
@@ -12,6 +14,25 @@ fileInput.addEventListener("change", () => {
   importBtn.disabled = !fileInput.files.length;
   statusEl.textContent = "";
 });
+
+(async function loadFolders() {
+  const status = await chrome.runtime.sendMessage({ type: "GET_STATUS" });
+  if (status?.locked) {
+    statusEl.textContent = "잠겨 있습니다. 먼저 팝업에서 잠금을 해제한 뒤 이 탭을 새로고침하세요.";
+    fileInput.disabled = true;
+    folderSelect.disabled = true;
+    newFolderInput.disabled = true;
+    return;
+  }
+  const res = await chrome.runtime.sendMessage({ type: "GET_FOLDERS" });
+  if (!res?.ok) return;
+  for (const folder of res.folders) {
+    const opt = document.createElement("option");
+    opt.value = folder.id;
+    opt.textContent = folder.name;
+    folderSelect.appendChild(opt);
+  }
+})();
 
 importBtn.addEventListener("click", async () => {
   const file = fileInput.files[0];
@@ -24,12 +45,18 @@ importBtn.addEventListener("click", async () => {
       statusEl.textContent = "이 파일에서 로그인 항목을 찾지 못했습니다.";
       return;
     }
-    const res = await chrome.runtime.sendMessage({ type: "IMPORT_ITEMS", entries });
+    const res = await chrome.runtime.sendMessage({
+      type: "IMPORT_ITEMS",
+      entries,
+      folderId: folderSelect.value || null,
+      newFolderName: newFolderInput.value,
+    });
     if (!res?.ok) {
       statusEl.textContent = res?.error === "Locked" ? "잠겨 있습니다. 먼저 팝업에서 잠금을 해제하세요." : res?.error || "가져오기 실패";
       return;
     }
     statusEl.textContent = `${res.imported}개 가져왔습니다. 이미 있던 ${res.skipped}개는 건너뛰었고, ${res.failed}개는 실패했습니다.`;
+    if (newFolderInput.value.trim()) location.reload(); // 새 폴더가 생겼으니 목록을 다시 불러온다
   } catch (err) {
     statusEl.textContent = `가져오기 실패: ${err.message}`;
   } finally {

@@ -154,6 +154,25 @@ test("updateCipher throws the server's error message on failure", async () => {
   await assert.rejects(new VaultwardenClient("https://vault.test").updateCipher("tok", "1", {}), /bad cipher/);
 });
 
+test("createFolder posts the encrypted name and returns the created folder", async () => {
+  let sentUrl, sentOpts;
+  fetchImpl = async (url, opts) => {
+    sentUrl = url;
+    sentOpts = opts;
+    return jsonResponse({ id: "folder-1", name: "enc-name" });
+  };
+  const result = await new VaultwardenClient("https://vault.test").createFolder("tok", "enc-name");
+  assert.equal(sentUrl, "https://vault.test/api/folders");
+  assert.equal(sentOpts.method, "POST");
+  assert.deepEqual(JSON.parse(sentOpts.body), { name: "enc-name" });
+  assert.deepEqual(result, { id: "folder-1", name: "enc-name" });
+});
+
+test("createFolder throws the server's error message on failure", async () => {
+  fetchImpl = async () => jsonResponse({ Message: "bad folder" }, 400);
+  await assert.rejects(new VaultwardenClient("https://vault.test").createFolder("tok", "enc-name"), /bad folder/);
+});
+
 test("deleteCipher sends a DELETE to the cipher's id", async () => {
   let sentUrl, sentOpts;
   fetchImpl = async (url, opts) => {

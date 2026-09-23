@@ -89,7 +89,11 @@ async function makeCipher(id, name, key, extra = {}) {
   };
 }
 
-function seedSession(ciphers) {
+async function makeFolder(id, name, key) {
+  return { id, name: await encryptString(name, key) };
+}
+
+function seedSession(ciphers, folders = []) {
   store.session.session = {
     serverUrl: "https://vault.test",
     email: "user@example.test",
@@ -99,6 +103,7 @@ function seedSession(ciphers) {
     expiresIn: 7200,
     userKey: keysToB64(userKey),
     ciphers,
+    folders,
   };
 }
 
@@ -539,9 +544,10 @@ test("IMPORT_ITEMS creates new items and skips ones already saved for the same s
     ],
   });
 
-  assert.deepEqual(res, { ok: true, imported: 1, skipped: 1, failed: 0 });
+  assert.deepEqual(res, { ok: true, imported: 1, skipped: 1, failed: 0, folderId: null });
   assert.equal(posted.length, 1);
   assert.equal(await decryptEncString(posted[0].login.password, userKey), "hunter2");
+  assert.equal(posted[0].folderId, null);
 
   const items = await send({ type: "GET_ITEMS" });
   assert.ok(items.items.some((i) => i.name === "NewSite"));
@@ -550,7 +556,64 @@ test("IMPORT_ITEMS creates new items and skips ones already saved for the same s
 test("IMPORT_ITEMS counts entries whose url can't be parsed as failed instead of throwing", async () => {
   seedSession([]);
   const res = await send({ type: "IMPORT_ITEMS", entries: [{ url: "", password: "pw" }] });
-  assert.deepEqual(res, { ok: true, imported: 0, skipped: 0, failed: 1 });
+  assert.deepEqual(res, { ok: true, imported: 0, skipped: 0, failed: 1, folderId: null });
+});
+
+test("IMPORT_ITEMS assigns imported items to an existing folderId", async () => {
+  seedSession([], [await makeFolder("f1", "Work", userKey)]);
+  let posted;
+  fetchImpl = async (_url, opts) => {
+    posted = JSON.parse(opts.body);
+    return jsonResponse({ id: "new-1", type: 1, ...posted });
+  };
+
+  const res = await send({
+    type: "IMPORT_ITEMS",
+    entries: [{ url: "https://a.test", username: "me", password: "pw" }],
+    folderId: "f1",
+  });
+
+  assert.equal(res.ok, true);
+  assert.equal(res.folderId, "f1");
+  assert.equal(posted.folderId, "f1");
+});
+
+test("IMPORT_ITEMS with newFolderName creates the folder first and assigns items to it", async () => {
+  seedSession([], []);
+  const calls = [];
+  fetchImpl = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    calls.push({ url, body });
+    if (url.endsWith("/api/folders")) return jsonResponse({ id: "new-folder-1", name: body.name });
+    return jsonResponse({ id: "new-cipher-1", type: 1, ...body });
+  };
+
+  const res = await send({
+    type: "IMPORT_ITEMS",
+    entries: [{ url: "https://a.test", username: "me", password: "pw" }],
+    newFolderName: "회사",
+  });
+
+  assert.equal(res.ok, true);
+  assert.equal(res.folderId, "new-folder-1");
+  assert.equal(calls[0].url, "https://vault.test/api/folders");
+  assert.equal(await decryptEncString(calls[0].body.name, userKey), "회사");
+  assert.equal(calls[1].body.folderId, "new-folder-1");
+
+  const folders = await send({ type: "GET_FOLDERS" });
+  assert.ok(folders.folders.some((f) => f.id === "new-folder-1" && f.name === "회사"));
+});
+
+test("GET_FOLDERS decrypts folder names", async () => {
+  seedSession([], [await makeFolder("f1", "Work", userKey), await makeFolder("f2", "Personal", userKey)]);
+  const res = await send({ type: "GET_FOLDERS" });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.folders.map((f) => f.name).sort(), ["Personal", "Work"]);
+});
+
+test("GET_FOLDERS fails while locked instead of throwing", async () => {
+  const res = await send({ type: "GET_FOLDERS" });
+  assert.deepEqual(res, { ok: false, error: "Locked" });
 });
 
 test("IMPORT_ITEMS rejects an empty or oversized entry list", async () => {

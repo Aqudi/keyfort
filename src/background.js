@@ -66,7 +66,7 @@ async function persistVault(session) {
   const encRefreshToken = session.refreshToken
     ? await encryptString(session.refreshToken, userKeyFromSession(session))
     : null;
-  await chrome.storage.local.set({ vault: { ...vault, ciphers: session.ciphers, encRefreshToken } });
+  await chrome.storage.local.set({ vault: { ...vault, ciphers: session.ciphers, folders: session.folders, encRefreshToken } });
 }
 
 function userKeyToB64(userKey) {
@@ -87,6 +87,7 @@ async function unlockWithUserKey(vault, userKey) {
       expiresIn: 0,
       userKey: keys,
       ciphers: vault.ciphers || [],
+      folders: vault.folders || [],
     },
   });
   // 캐시로 바로 열고, 최신 항목은 뒤에서 받아온다. 오프라인이거나 토큰이 만료돼도 잠금 해제는 성공한다.
@@ -249,9 +250,10 @@ async function doLogin({ serverUrl, email, password, twoFactorCode }) {
 
   const syncData = await client.sync(loginData.access_token);
   const ciphers = syncData.ciphers ?? syncData.Ciphers ?? [];
+  const folders = syncData.folders ?? syncData.Folders ?? [];
 
   await chrome.storage.local.set({
-    vault: { serverUrl, email, kdfIterations, protectedKey: loginData.Key, ciphers: [], encRefreshToken: null },
+    vault: { serverUrl, email, kdfIterations, protectedKey: loginData.Key, ciphers: [], folders: [], encRefreshToken: null },
   });
   // 다른 계정으로 로그인했으면 이전 계정 기준의 PIN은 무효다.
   const { pin } = await chrome.storage.session.get(["pin"]);
@@ -265,6 +267,7 @@ async function doLogin({ serverUrl, email, password, twoFactorCode }) {
     expiresIn: loginData.expires_in,
     userKey: userKeyToB64(userKey),
     ciphers,
+    folders,
   };
   lockEpoch += 1;
   await setSession(session);
@@ -296,7 +299,8 @@ async function doSync() {
   const client = new VaultwardenClient(session.serverUrl);
   const syncData = await client.sync(session.accessToken);
   const ciphers = syncData.ciphers ?? syncData.Ciphers ?? [];
-  await updateSession({ ...session, ciphers }, epoch);
+  const folders = syncData.folders ?? syncData.Folders ?? [];
+  await updateSession({ ...session, ciphers, folders }, epoch);
   return ciphers;
 }
 
@@ -334,6 +338,21 @@ async function decryptCipherSummary(cipher, userKey) {
     uris,
     hasTotp,
   };
+}
+
+async function getFolderList() {
+  const session = await getSession();
+  if (!session) throw new Error("Locked");
+  const userKey = userKeyFromSession(session);
+  const folders = [];
+  for (const f of session.folders || []) {
+    try {
+      folders.push({ id: cipherField(f, "id", "Id"), name: await decryptEncString(cipherField(f, "name", "Name"), userKey) });
+    } catch {
+      /* undecryptable folder name — skip it rather than fail the whole list */
+    }
+  }
+  return folders;
 }
 
 async function getItemList() {
@@ -434,19 +453,30 @@ async function saveItem({ host, username, password }) {
 }
 
 const MAX_IMPORT_ENTRIES = 2000;
+const MAX_FOLDER_NAME_LENGTH = 100;
 
 // Chrome/Arc/Edge/Brave나 1Password에서 내보낸 CSV를 통째로 가져온다. 이미 같은 아이디+사이트로
 // 저장된 항목은 조용히 건너뛴다(중복 정리) — 1Password류의 "그냥 가져오기"에 맞춰 미리보기는 없다.
-async function importItems(entries) {
+// folderSelection.newFolderName이 있으면 새 폴더를 만들어 거기 넣고, 없으면 folderId(빈 값이면 폴더 없음)를 쓴다.
+async function importItems(entries, folderSelection = {}) {
   const epoch = lockEpoch;
   const session = await getSession();
   if (!session) throw new Error("Locked");
+  const userKey = userKeyFromSession(session);
+  const client = new VaultwardenClient(session.serverUrl);
+
+  let folderId = folderSelection.folderId || null;
+  let newFolder = null;
+  const newFolderName = String(folderSelection.newFolderName || "").trim().slice(0, MAX_FOLDER_NAME_LENGTH);
+  if (newFolderName) {
+    newFolder = await client.createFolder(session.accessToken, await encryptString(newFolderName, userKey));
+    folderId = cipherField(newFolder, "id", "Id");
+  }
+
   const { items: existing } = await getItemList();
   const alreadySaved = (username, host) =>
     existing.some((item) => item.username === username && item.uris.some((u) => isSameSite(uriHostname(u), host)));
 
-  const userKey = userKeyFromSession(session);
-  const client = new VaultwardenClient(session.serverUrl);
   const created = [];
   let skipped = 0;
   let failed = 0;
@@ -466,7 +496,7 @@ async function importItems(entries) {
         name: await encryptString(entry.name || host, userKey),
         notes: entry.notes ? await encryptString(entry.notes, userKey) : null,
         favorite: false,
-        folderId: null,
+        folderId,
         organizationId: null,
         login: {
           username: entry.username ? await encryptString(entry.username, userKey) : null,
@@ -480,12 +510,19 @@ async function importItems(entries) {
       failed += 1;
     }
   }
-  if (created.length) {
+  if (created.length || newFolder) {
     const current = await getSession();
     if (!current) throw new Error("Locked");
-    await updateSession({ ...current, ciphers: [...current.ciphers, ...created] }, epoch);
+    await updateSession(
+      {
+        ...current,
+        ciphers: [...current.ciphers, ...created],
+        folders: newFolder ? [...(current.folders || []), newFolder] : current.folders,
+      },
+      epoch
+    );
   }
-  return { imported: created.length, skipped, failed };
+  return { imported: created.length, skipped, failed, folderId };
 }
 
 // 현재 탭 사이트와 일치하는 저장된 계정 목록(이름/사용자명만, 비밀번호 없음).
@@ -704,6 +741,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, items, skipped });
           break;
         }
+        case "GET_FOLDERS": {
+          sendResponse({ ok: true, folders: await getFolderList() });
+          break;
+        }
         case "GET_ITEM_SECRETS": {
           const secrets = await getItemSecrets(msg.id);
           sendResponse({ ok: true, ...secrets });
@@ -745,7 +786,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             sendResponse({ ok: false, error: "가져올 항목이 없습니다." });
             break;
           }
-          sendResponse({ ok: true, ...(await importItems(msg.entries)) });
+          sendResponse({ ok: true, ...(await importItems(msg.entries, { folderId: msg.folderId, newFolderName: msg.newFolderName })) });
           break;
         }
         case "SAVE_TOTP": {
