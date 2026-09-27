@@ -2,7 +2,7 @@
 
 import { icon } from "./icons.js";
 import { brandHtml } from "./brand.js";
-import { uriHostname, isSameSite } from "./lib/site.js";
+import { uriHostname, uriMatches } from "./lib/site.js";
 
 const app = document.getElementById("app");
 
@@ -75,7 +75,7 @@ function initials(name) {
 let serverUrl = "";
 
 function faviconHtml(item, extraStyle = "") {
-  const host = item.uris.map(uriHostname).find(Boolean);
+  const host = item.uris.map((u) => uriHostname(u.uri)).find(Boolean);
   const img = host && serverUrl
     ? `<img src="${escapeHtml(serverUrl.replace(/\/+$/, ""))}/icons/${encodeURIComponent(host)}/icon.png" alt="" />`
     : "";
@@ -340,86 +340,6 @@ function renderUnlock(status, { usePassword = false } = {}) {
   input.focus();
 }
 
-const LOCK_OPTIONS = [
-  [1, "1분"],
-  [5, "5분"],
-  [15, "15분"],
-  [30, "30분"],
-  [60, "1시간"],
-  [0, "브라우저 종료 시"],
-];
-
-async function renderSettings() {
-  stopTotpTimer();
-  const status = await send({ type: "GET_STATUS" });
-  if (status.locked) return renderLocked();
-  app.innerHTML = `
-    <div class="header">
-      <button class="back-btn" id="backBtn">${icon("back")} 설정</button>
-    </div>
-    <div class="body">
-      <section class="settings-card">
-        <div class="settings-title">자동 잠금</div>
-        <div class="settings-desc">팝업을 쓰거나 계정을 골라 채우지 않은 채 이 시간이 지나면 잠급니다.</div>
-        <div class="segmented" role="radiogroup" aria-label="자동 잠금 시간">
-          ${LOCK_OPTIONS.map(
-            ([m, label]) =>
-              `<button role="radio" aria-checked="${m === status.lockMinutes}" class="${m === status.lockMinutes ? "on" : ""}" data-m="${m}">${label}</button>`
-          ).join("")}
-        </div>
-      </section>
-      <section class="settings-card">
-        <div class="settings-title">PIN 잠금 해제 ${status.pinEnabled ? '<span class="on-chip">사용 중</span>' : ""}</div>
-        <div class="settings-desc">마스터 비밀번호 대신 숫자 PIN으로 엽니다. 브라우저를 완전히 닫으면 PIN은 지워지고 한 번은 마스터 비밀번호가 필요해요. 5번 틀리면 해제됩니다.</div>
-        <div class="pin-row">
-          <input type="password" id="newPin" inputmode="numeric" maxlength="8" placeholder="${status.pinEnabled ? "새 PIN (4~8자리)" : "PIN (4~8자리)"}" />
-          <button class="btn btn-primary" id="savePin">${status.pinEnabled ? "변경" : "설정"}</button>
-        </div>
-        ${status.pinEnabled ? '<button class="link-btn danger" id="removePin">PIN 해제</button>' : ""}
-      </section>
-      <section class="settings-card">
-        <div class="settings-title">가져오기</div>
-        <div class="settings-desc">Chrome, Arc, Edge, Brave, 1Password에서 내보낸 CSV를 가져옵니다.</div>
-        <button class="btn btn-secondary" id="importBtn">가져오기 열기</button>
-      </section>
-      <section class="settings-card">
-        <div class="settings-title">계정</div>
-        <div class="settings-desc">${escapeHtml(status.email)}</div>
-        <button class="btn btn-secondary" id="logoutBtn">로그아웃</button>
-      </section>
-    </div>
-  `;
-  document.getElementById("backBtn").addEventListener("click", renderVault);
-  document.querySelectorAll(".segmented button").forEach((b) =>
-    b.addEventListener("click", async () => {
-      const res = await send({ type: "SET_LOCK_MINUTES", minutes: Number(b.dataset.m) });
-      if (!res?.ok) return showToast(res?.error || "저장 실패", ERROR_TOAST_MS);
-      renderSettings();
-      showToast("저장됨");
-    })
-  );
-  const savePin = async () => {
-    const res = await send({ type: "SET_PIN", pin: document.getElementById("newPin").value });
-    if (await handleLockedResponse(res)) return;
-    if (!res?.ok) return showToast(res?.error || "PIN 설정 실패", ERROR_TOAST_MS);
-    renderSettings();
-    showToast("PIN 설정됨");
-  };
-  document.getElementById("savePin").addEventListener("click", savePin);
-  document.getElementById("newPin").addEventListener("keydown", (e) => e.key === "Enter" && savePin());
-  document.getElementById("removePin")?.addEventListener("click", async () => {
-    await send({ type: "REMOVE_PIN" });
-    renderSettings();
-    showToast("PIN 해제됨");
-  });
-  document.getElementById("logoutBtn").addEventListener("click", async () => {
-    await send({ type: "LOGOUT" });
-    renderLogin(status);
-  });
-  // 파일 선택창을 열면 팝업이 그대로 닫혀버려서(MV3 제약), 옵션 탭에서 진행한다.
-  document.getElementById("importBtn").addEventListener("click", () => chrome.runtime.openOptionsPage());
-}
-
 async function renderVault() {
   stopTotpTimer();
   app.innerHTML = `
@@ -450,7 +370,8 @@ async function renderVault() {
     await send({ type: "LOCK" });
     renderLocked();
   });
-  document.getElementById("settingsBtn").addEventListener("click", renderSettings);
+  // 1Password처럼 설정은 넓은 옵션 탭에서 다룬다 — 팝업엔 자리도 없고, 파일 선택창은 팝업을 닫아버린다.
+  document.getElementById("settingsBtn").addEventListener("click", () => chrome.runtime.openOptionsPage());
 
   document.getElementById("syncBtn").addEventListener("click", async () => {
     const btn = document.getElementById("syncBtn");
@@ -491,7 +412,7 @@ async function renderVault() {
       skipped > 0 ? `복호화할 수 없는 항목 ${skipped}개는 표시되지 않습니다` : "";
     if (host) {
       const siteRow = document.getElementById("currentSiteRow");
-      const matches = allItems.filter((i) => i.uris.some((u) => u.includes(host)));
+      const matches = allItems.filter((i) => i.uris.some((u) => u.uri.includes(host)));
       siteRow.innerHTML = `${icon("globe")}<span>${escapeHtml(
         matches.length ? `${host}에 대한 항목 ${matches.length}개` : `${host} — 저장된 항목 없음`
       )}</span>`;
@@ -507,14 +428,14 @@ async function renderVault() {
           (i) =>
             i.name?.toLowerCase().includes(q) ||
             i.username?.toLowerCase().includes(q) ||
-            i.uris.some((u) => u.toLowerCase().includes(q))
+            i.uris.some((u) => u.uri.toLowerCase().includes(q))
         );
 
     // Sort: matches for current host first (copy — allItems must not be reordered in place)
     const sorted = host
       ? [...filtered].sort((a, b) => {
-          const aMatch = a.uris.some((u) => u.includes(host)) ? 0 : 1;
-          const bMatch = b.uris.some((u) => u.includes(host)) ? 0 : 1;
+          const aMatch = a.uris.some((u) => u.uri.includes(host)) ? 0 : 1;
+          const bMatch = b.uris.some((u) => u.uri.includes(host)) ? 0 : 1;
           return aMatch - bMatch;
         })
       : filtered;
@@ -566,12 +487,15 @@ async function renderItemDetail(id, allItems) {
       ${brandHtml()}
     </div>
     <div class="body">
-      <div class="back-btn" id="backBtn">${icon("back")} 목록으로</div>
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <div class="back-btn" id="backBtn">${icon("back")} 목록으로</div>
+        <button class="icon-btn" id="editBtn" title="수정" aria-label="세부정보 수정">${icon("edit")}</button>
+      </div>
       <div style="display:flex; align-items:center; gap:10px;">
         ${faviconHtml(item, "width:40px;height:40px;font-size:15px;")}
         <div>
           <div style="font-weight:700; font-size:15px;">${escapeHtml(item.name)}</div>
-          <div class="item-sub">${item.uris[0] ? escapeHtml(item.uris[0]) : ""}</div>
+          <div class="item-sub">${item.uris[0] ? escapeHtml(item.uris[0].uri) : ""}</div>
         </div>
       </div>
 
@@ -621,6 +545,7 @@ async function renderItemDetail(id, allItems) {
   `;
 
   document.getElementById("backBtn").addEventListener("click", renderVault);
+  document.getElementById("editBtn").addEventListener("click", () => renderItemEdit(item, res, allItems));
   hideBrokenIcons(app);
 
   const pwField = document.getElementById("pwField");
@@ -647,13 +572,116 @@ async function renderItemDetail(id, allItems) {
   }
 }
 
+function renderItemEdit(item, secrets, allItems) {
+  stopTotpTimer();
+  app.innerHTML = `
+    <div class="header">${brandHtml()}</div>
+    <div class="body">
+      <div class="back-btn" id="cancelBtn">${icon("back")} 취소</div>
+      <div>
+        <label class="field-label">이름</label>
+        <input type="text" id="editName" value="${escapeHtml(item.name || "")}" />
+      </div>
+      <div>
+        <label class="field-label">사용자 이름</label>
+        <input type="text" id="editUsername" value="${escapeHtml(item.username || "")}" />
+      </div>
+      <div>
+        <label class="field-label">비밀번호</label>
+        <input type="text" id="editPassword" autocomplete="off" value="${escapeHtml(secrets.password || "")}" />
+      </div>
+      <div>
+        <label class="field-label">웹사이트 (한 줄에 하나씩)</label>
+        <textarea id="editUris" rows="3">${escapeHtml(item.uris.map((u) => u.uri).join("\n"))}</textarea>
+      </div>
+      <div>
+        <label class="field-label">메모</label>
+        <textarea id="editNotes" rows="3">${escapeHtml(secrets.notes || "")}</textarea>
+      </div>
+      ${
+        item.hasTotp
+          ? `<label style="display:flex; align-items:center; gap:6px; font-size:12px;">
+              <input type="checkbox" id="removeTotp" /> 인증 코드(TOTP) 제거
+            </label>`
+          : ""
+      }
+      <div id="errorBox"></div>
+      <button class="btn btn-primary" id="saveBtn">저장</button>
+      <button class="link-btn" id="deleteBtn" style="color:#e5484d;">이 항목 삭제</button>
+    </div>
+  `;
+
+  document.getElementById("cancelBtn").addEventListener("click", () => renderItemDetail(item.id, allItems));
+
+  document.getElementById("deleteBtn").addEventListener("click", async () => {
+    if (!confirm(`"${item.name || "(이름 없음)"}" 항목을 삭제할까요? 되돌릴 수 없습니다.`)) return;
+    const errorBox = document.getElementById("errorBox");
+    errorBox.innerHTML = "";
+    try {
+      const res = await send({ type: "DELETE_ITEM", id: item.id });
+      if (await handleLockedResponse(res)) return;
+      if (!res?.ok) {
+        errorBox.innerHTML = `<div class="error-box">${escapeHtml(res?.error || "알 수 없는 오류")}</div>`;
+        return;
+      }
+      showToast("삭제되었습니다.");
+      renderVault();
+    } catch (err) {
+      errorBox.innerHTML = `<div class="error-box">${escapeHtml(err.message)}</div>`;
+    }
+  });
+
+  document.getElementById("saveBtn").addEventListener("click", async () => {
+    const btn = document.getElementById("saveBtn");
+    const errorBox = document.getElementById("errorBox");
+    errorBox.innerHTML = "";
+    const name = document.getElementById("editName").value.trim();
+    const password = document.getElementById("editPassword").value;
+    if (!name || !password) {
+      errorBox.innerHTML = `<div class="error-box">이름과 비밀번호는 필수입니다.</div>`;
+      return;
+    }
+    const uris = document
+      .getElementById("editUris")
+      .value.split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    btn.disabled = true;
+    btn.textContent = "저장 중...";
+    try {
+      const res = await send({
+        type: "UPDATE_ITEM",
+        id: item.id,
+        name,
+        username: document.getElementById("editUsername").value.trim() || null,
+        password,
+        notes: document.getElementById("editNotes").value.trim() || null,
+        uris,
+        removeTotp: document.getElementById("removeTotp")?.checked || false,
+      });
+      if (await handleLockedResponse(res)) return;
+      if (!res?.ok) {
+        errorBox.innerHTML = `<div class="error-box">${escapeHtml(res?.error || "알 수 없는 오류")}</div>`;
+        return;
+      }
+      showToast("저장되었습니다.");
+      renderVault();
+    } catch (err) {
+      errorBox.innerHTML = `<div class="error-box">${escapeHtml(err.message)}</div>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "저장";
+    }
+  });
+}
+
 async function autofillActiveTab(item, password, totp) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return;
 
   // 선택한 항목의 사이트와 다른 탭이면 비밀번호를 넘기기 전에 사용자 확인을 받는다.
   const tabHost = uriHostname(tab.url || "");
-  const isMatch = item.uris.some((u) => isSameSite(tabHost, uriHostname(u)));
+  const isMatch = item.uris.some((u) => uriMatches(u.uri, u.match, tab.url || ""));
   if (!isMatch && !confirm(`현재 탭(${tabHost || "알 수 없음"})은 이 항목의 사이트와 일치하지 않습니다.\n그래도 자동입력할까요?`)) {
     return;
   }
