@@ -9,7 +9,7 @@ import {
   generateTotp,
 } from "./lib/crypto.js";
 import { VaultwardenClient } from "./lib/api.js";
-import { uriHostname, isSameSite } from "./lib/site.js";
+import { uriHostname, uriMatches } from "./lib/site.js";
 
 const DEFAULT_LOCK_MINUTES = 15;
 const LOCK_MINUTE_CHOICES = [1, 5, 15, 30, 60, 0]; // 0 = 타이머 없음, 브라우저를 완전히 닫을 때만 잠김
@@ -34,14 +34,23 @@ async function setConfig(cfg) {
   await chrome.storage.local.set(cfg);
 }
 
+// ciphers/folders는 storage.session에 안 둔다 — storage.session은 unlimitedStorage로도 못 늘어나는
+// 하드 10MB 한도가 있어서(직접 확인함), 계정에 항목이 많아지면 조용히 quota exceeded로 저장이 실패한다.
+// 대신 storage.local(잠긴 금고, 이미 암호문이라 디스크에 있어도 안전)에서 매번 합쳐서 돌려준다.
 async function getSession() {
   const { session } = await chrome.storage.session.get(["session"]);
-  return session || null;
+  if (!session) return null;
+  const vault = await getVault();
+  return { ...session, ciphers: vault?.ciphers || [], folders: vault?.folders || [] };
 }
 
-async function setSession(session) {
-  await chrome.storage.session.set({ session });
-  await persistVault(session);
+async function setSession(session, epoch = lockEpoch) {
+  const { ciphers, folders, ...small } = session;
+  await persistVault(session); // ciphers/folders는 storage.local로 (unlimitedStorage가 실제로 적용됨)
+  // persistVault가 await를 거치는 동안 LOCK/auto-lock이 끼어들 수 있다 — 그 사이 잠겼으면 여기서
+  // storage.session에 "session"을 다시 써서 잠금을 되살리면 안 된다(updateSession의 epoch 재검사와 같은 이유).
+  if (epoch !== lockEpoch) throw new Error("Locked");
+  await chrome.storage.session.set({ session: small });
 }
 
 async function clearSession() {
@@ -77,6 +86,8 @@ async function unlockWithUserKey(vault, userKey) {
   const keys = userKeyToB64(userKey);
   const refreshToken = vault.encRefreshToken ? await decryptEncString(vault.encRefreshToken, userKey) : null;
   lockEpoch += 1;
+  // ciphers/folders는 여기서 storage.session에 쓰지 않는다 — getSession()이 storage.local(vault)에서
+  // 바로 합쳐서 돌려준다. vault.ciphers는 이미 거기 있으니 다시 쓸 필요도 없다.
   await chrome.storage.session.set({
     session: {
       serverUrl: vault.serverUrl,
@@ -86,8 +97,6 @@ async function unlockWithUserKey(vault, userKey) {
       tokenObtainedAt: 0, // 다음 서버 호출 때 refresh token으로 새 access token을 받는다
       expiresIn: 0,
       userKey: keys,
-      ciphers: vault.ciphers || [],
-      folders: vault.folders || [],
     },
   });
   // 캐시로 바로 열고, 최신 항목은 뒤에서 받아온다. 오프라인이거나 토큰이 만료돼도 잠금 해제는 성공한다.
@@ -113,12 +122,15 @@ async function pinKey(pin, email) {
   return stretchKey(await deriveMasterKey(pin, `${email}|keyfort-pin`, PIN_KDF_ITERATIONS));
 }
 
+// PIN은 storage.local(디스크)에 둔다 — 1Password/Bitwarden처럼 브라우저를 껐다 켜도 그대로 남아야
+// "간편 비밀번호"로서 의미가 있다. 마스터 비밀번호와 같은 강도의 KDF(60만 회)로 감싸서 저장하므로
+// (vault.protectedKey와 동일한 모델) 디스크에 있어도 오프라인 대입이 비현실적으로 느리다.
 async function setPin(pin) {
   if (!/^\d{4,8}$/.test(pin)) throw new Error("PIN은 숫자 4~8자리여야 합니다.");
   const session = await getSession();
   if (!session) throw new Error("Locked");
   const wrapped = await encryptString(JSON.stringify(session.userKey), await pinKey(pin, session.email));
-  await chrome.storage.session.set({ pin: { email: session.email, wrapped, failures: 0 } });
+  await chrome.storage.local.set({ pin: { email: session.email, wrapped, failures: 0 } });
 }
 
 // 시도는 한 번에 하나씩만 처리한다. 동시에 여러 요청이 오면 모두 같은 실패 횟수를 읽고(느린 KDF 동안)
@@ -131,24 +143,24 @@ function unlockWithPin(pin) {
 }
 
 async function unlockWithPinNow(pin) {
-  const { pin: record } = await chrome.storage.session.get(["pin"]);
+  const { pin: record } = await chrome.storage.local.get(["pin"]);
   const vault = await getVault();
   if (!record || !vault || record.email !== vault.email) throw new Error("PIN이 설정되어 있지 않습니다.");
   let keys;
   try {
     keys = JSON.parse(await decryptEncString(record.wrapped, await pinKey(pin, record.email)));
   } catch {
-    const { pin: current } = await chrome.storage.session.get(["pin"]);
+    const { pin: current } = await chrome.storage.local.get(["pin"]);
     if (current?.wrapped !== record.wrapped) throw new Error("PIN이 설정되어 있지 않습니다."); // KDF 중 해제·변경됨
     const failures = record.failures + 1;
     if (failures >= MAX_PIN_ATTEMPTS) {
-      await chrome.storage.session.remove(["pin"]);
+      await chrome.storage.local.remove(["pin"]);
       return { ok: false, pinDisabled: true, error: `PIN을 ${MAX_PIN_ATTEMPTS}번 틀려 해제했습니다. 마스터 비밀번호로 여세요.` };
     }
-    await chrome.storage.session.set({ pin: { ...record, failures } });
+    await chrome.storage.local.set({ pin: { ...record, failures } });
     return { ok: false, error: `PIN이 올바르지 않습니다. (${MAX_PIN_ATTEMPTS - failures}번 남음)` };
   }
-  await chrome.storage.session.set({ pin: { ...record, failures: 0 } });
+  await chrome.storage.local.set({ pin: { ...record, failures: 0 } });
   await unlockWithUserKey(vault, {
     encKey: Uint8Array.from(atob(keys.encKey), (c) => c.charCodeAt(0)),
     macKey: Uint8Array.from(atob(keys.macKey), (c) => c.charCodeAt(0)),
@@ -158,8 +170,7 @@ async function unlockWithPinNow(pin) {
 
 async function logout() {
   await clearSession();
-  await chrome.storage.session.remove(["pin"]);
-  await chrome.storage.local.remove(["vault", "lastUsed"]);
+  await chrome.storage.local.remove(["pin", "vault", "lastUsed"]);
 }
 
 async function getLockMinutes() {
@@ -175,7 +186,7 @@ async function updateSession(session, epoch) {
   if (epoch !== lockEpoch) throw new Error("Locked");
   if (!(await getSession())) throw new Error("Locked");
   if (epoch !== lockEpoch) throw new Error("Locked");
-  await setSession(session);
+  await setSession(session, epoch);
 }
 
 async function scheduleAutoLock() {
@@ -256,8 +267,8 @@ async function doLogin({ serverUrl, email, password, twoFactorCode }) {
     vault: { serverUrl, email, kdfIterations, protectedKey: loginData.Key, ciphers: [], folders: [], encRefreshToken: null },
   });
   // 다른 계정으로 로그인했으면 이전 계정 기준의 PIN은 무효다.
-  const { pin } = await chrome.storage.session.get(["pin"]);
-  if (pin && pin.email !== email) await chrome.storage.session.remove(["pin"]);
+  const { pin } = await chrome.storage.local.get(["pin"]);
+  if (pin && pin.email !== email) await chrome.storage.local.remove(["pin"]);
   const session = {
     serverUrl,
     email,
@@ -279,7 +290,21 @@ async function ensureFreshToken(session, epoch) {
   const ageSec = (Date.now() - session.tokenObtainedAt) / 1000;
   if (ageSec < (session.expiresIn || 3600) - 60) return session;
   const client = new VaultwardenClient(session.serverUrl);
-  const data = await client.refreshToken(session.refreshToken);
+  let data;
+  try {
+    data = await client.refreshToken(session.refreshToken);
+  } catch (err) {
+    // Vaultwarden refresh tokens are single-use (rotate on every refresh); a 400/401 means this one
+    // is permanently dead (e.g. a previous refresh's rotated token never got persisted), not just
+    // offline. Left alone, accessToken stays null forever and every server call keeps failing the
+    // same way while the cached vault still renders — looks "logged in" but nothing can save/sync.
+    // Force a clean logout so the next popup open shows the real login screen instead of that limbo.
+    if (err.status === 400 || err.status === 401) {
+      await logout();
+      throw new Error("세션이 만료되었습니다. 다시 로그인해 주세요.");
+    }
+    throw err;
+  }
   const refreshed = {
     ...session,
     accessToken: data.access_token,
@@ -323,7 +348,7 @@ async function decryptCipherSummary(cipher, userKey) {
       const encUri = cipherField(uriObj, "uri", "Uri");
       if (encUri) {
         try {
-          uris.push(await decryptEncString(encUri, userKey));
+          uris.push({ uri: await decryptEncString(encUri, userKey), match: cipherField(uriObj, "match", "Match") ?? null });
         } catch {
           /* ignore individual bad uri */
         }
@@ -337,6 +362,12 @@ async function decryptCipherSummary(cipher, userKey) {
     username,
     uris,
     hasTotp,
+    // 페더레이션 로그인("Google로 로그인함") 항목은 비밀번호가 없다 — 이미 저장된 일반 비밀번호
+    // 항목과 구분하는 유일한 단서라 여기서 표시해 둔다(saveFederatedLogin 참고).
+    hasPassword: !!cipherField(login || {}, "password", "Password"),
+    // 서버가 주는 그대로(암호화 안 된 필드) — 언제 만들었고/고쳤는지는 중복 정리처럼
+    // "둘 중 뭘 남길지" 판단할 때 마지막 자동입력 기록이 없어도 쓸 수 있는 단서가 된다.
+    revisionDate: cipherField(cipher, "revisionDate", "RevisionDate") ?? null,
   };
 }
 
@@ -382,16 +413,56 @@ async function getItemSecrets(id) {
   const login = cipherField(cipher, "login", "Login");
   const passwordEnc = cipherField(login, "password", "Password");
   const totpEnc = cipherField(login, "totp", "Totp");
+  const notesEnc = cipherField(cipher, "notes", "Notes");
   const password = passwordEnc ? await decryptEncString(passwordEnc, userKey) : null;
-  if (!totpEnc) return { password, totp: null };
+  const notes = notesEnc ? await decryptEncString(notesEnc, userKey).catch(() => null) : null;
+  if (!totpEnc) return { password, notes, totp: null };
   // A corrupt TOTP seed must not take the password down with it.
   try {
     const seed = await decryptEncString(totpEnc, userKey);
-    return { password, totp: await generateTotp(seed) };
+    return { password, notes, totp: await generateTotp(seed) };
   } catch (err) {
     console.warn("TOTP generation failed:", err.message);
-    return { password, totp: null, totpError: err.message };
+    return { password, notes, totp: null, totpError: err.message };
   }
+}
+
+// 세부정보 수정 화면(팝업)에서 이름/아이디/비밀번호/URL들/메모를 통째로 교체한다.
+// URI는 문자열 그대로 넘어오고, 기존에 저장돼 있던 match 값은 같은 URI 문자열이면 그대로 유지한다.
+async function updateItem(id, { name, username, password, notes, uris, removeTotp }) {
+  const epoch = lockEpoch;
+  const session = await getSession();
+  if (!session) throw new Error("Locked");
+  const cipher = session.ciphers.find((c) => cipherField(c, "id", "Id") === id);
+  if (!cipher) throw new Error("항목을 찾을 수 없습니다.");
+  const userKey = userKeyFromSession(session);
+  const summary = await decryptCipherSummary(cipher, userKey);
+  const matchByUri = new Map(summary.uris.map((u) => [u.uri, u.match]));
+  const login = cipherField(cipher, "login", "Login");
+  const payload = {
+    type: 1,
+    name: await encryptString(name, userKey),
+    notes: notes ? await encryptString(notes, userKey) : null,
+    favorite: cipherField(cipher, "favorite", "Favorite") ?? false,
+    folderId: cipherField(cipher, "folderId", "FolderId") ?? null,
+    organizationId: cipherField(cipher, "organizationId", "OrganizationId") ?? null,
+    login: {
+      username: username ? await encryptString(username, userKey) : null,
+      password: await encryptString(password, userKey),
+      totp: removeTotp ? null : cipherField(login, "totp", "Totp") ?? null,
+      uris: await Promise.all(
+        uris.map(async (uri) => ({ uri: await encryptString(uri, userKey), match: matchByUri.get(uri) ?? null }))
+      ),
+    },
+  };
+  const client = new VaultwardenClient(session.serverUrl);
+  const updated = await client.updateCipher(session.accessToken, id, payload);
+  const current = await getSession();
+  if (!current) throw new Error("Locked");
+  await updateSession(
+    { ...current, ciphers: current.ciphers.map((c) => (cipherField(c, "id", "Id") === id ? updated : c)) },
+    epoch
+  );
 }
 
 // ---- 페이지 통합: 계정 자동 제안 + 새 로그인 저장 제안 ----------------------
@@ -401,12 +472,12 @@ async function getItemSecrets(id) {
 
 // 같은 사용자 이름이 이미 저장돼 있으면 다시 묻지 않는다.
 // ponytail: 비밀번호가 바뀐 경우의 "업데이트" 제안은 범위 밖 — 필요해지면 추가.
-async function maybeQueuePendingSave(tabId, host, username, password) {
+async function maybeQueuePendingSave(tabId, host, url, username, password) {
   const session = await getSession();
   if (!session) return; // 잠겨 있으면 비교/저장 둘 다 불가능하니 조용히 무시
   const { items } = await getItemList();
   const alreadySaved = items.some(
-    (item) => item.username === username && item.uris.some((u) => isSameSite(uriHostname(u), host))
+    (item) => item.username === username && item.uris.some((u) => uriMatches(u.uri, u.match, url))
   );
   if (alreadySaved) return;
   // ponytail: 탭이 닫히면 항목이 남을 수 있다(5분 뒤 TTL로 무시됨). 탭 종료 리스너 정리는 필요해지면 추가.
@@ -424,6 +495,154 @@ async function takePendingSave(tabId, tabUrl) {
   await chrome.storage.session.remove([key]); // 한 번 보여주면 끝 — 새로고침해도 다시 안 뜬다
   if (Date.now() - entry.createdAt > PENDING_SAVE_TTL_MS) return null;
   return { host: entry.host, username: entry.username, password: entry.password };
+}
+
+// "Google로 로그인" 같은 페더레이션 로그인은 이 사이트만 봐서는 비밀번호가 아예 없다 — 1Password처럼
+// "Google이(가) 여기 로그인에 사용됨"이라는 연결 기록만 저장한다.
+//
+// document.referrer로 감지하는 방식은 실전에서 안 됐다 — SSO 리다이렉트 체인은 자기 사이트가 먼저 만든
+// 중간 URL을 거치는 경우가 많고(예: github.com/orgs/x/sso → 서버가 302로 구글에 보냄), 그 중간 홉의
+// Referrer-Policy가 origin을 지워버리면 도착한 페이지에서 "어디서 왔는지"를 알 방법이 없다.
+// 대신 background가 chrome.tabs.onUpdated로 그 탭이 실제로 어느 호스트에서 어느 호스트로 넘어갔는지
+// 직접 추적한다 — 페이지의 JS나 헤더에 좌우되지 않는다. host_permissions가 이미 모든 사이트를 덮고
+// 있어서 별도 tabs 권한 없이도 tab.url이 보인다.
+const PENDING_FEDERATED_TTL_MS = 5 * 60 * 1000;
+const KNOWN_FEDERATED_PROVIDERS = new Set(["Google", "Microsoft", "Apple", "Okta"]);
+const FEDERATED_PROVIDER_HOSTS = [
+  { name: "Google", hostRe: /(^|\.)accounts\.google\.com$/ },
+  { name: "Microsoft", hostRe: /(^|\.)login\.microsoftonline\.com$/ },
+  { name: "Apple", hostRe: /(^|\.)appleid\.apple\.com$/ },
+  { name: "Okta", hostRe: /\.okta\.com$/ },
+];
+
+async function setPendingFederated(tabId, provider, originHost) {
+  await chrome.storage.session.set({
+    [`pendingFederated:${tabId}`]: { provider, originHost, createdAt: Date.now() },
+  });
+}
+
+// 탭이 새 URL로 넘어갈 때마다 직전 호스트를 기억해 뒀다가, 방금 도착한 호스트가 알려진 인증 전용
+// 도메인이면 "직전 호스트가 여기로 로그인을 위임했다"고 기록한다. 그 인증 도메인 안에서의 이동(같은
+// 호스트끼리)은 무시한다.
+async function trackFederatedNavigation(tabId, url) {
+  const newHost = uriHostname(url);
+  if (!newHost) return;
+  const key = `lastTabHost:${tabId}`;
+  const { [key]: prevHost } = await chrome.storage.session.get([key]);
+  await chrome.storage.session.set({ [key]: newHost });
+  if (!prevHost || prevHost === newHost) return;
+  console.debug(`[federated] tab ${tabId}: 탭 이동 감지 ${prevHost} -> ${newHost}`); // 임시: 실제 이동 경로 확인용
+  const provider = FEDERATED_PROVIDER_HOSTS.find((p) => p.hostRe.test(newHost));
+  if (provider) {
+    console.debug(`[federated] tab ${tabId}: ${prevHost} -> ${newHost} (${provider.name}) — pending 기록`);
+    await setPendingFederated(tabId, provider.name, prevHost);
+  }
+}
+
+// 사이트가 SSO를 팝업/새 탭으로 열 때(window.open 등)는 원래 탭의 URL이 안 바뀌므로
+// trackFederatedNavigation(같은 탭 안 이동만 봄)으로는 못 잡는다. chrome.webNavigation의
+// onCreatedNavigationTarget이 "어느 탭이 새 탭을 열었는지"(sourceTabId)를 알려주므로, 새 탭이 아니라
+// 그 원본 탭 기준으로 기록을 남긴다 — 팝업이 로그인 후 스스로 닫혀도 원본 탭이 그 기록을 보게 된다.
+async function trackFederatedPopup(sourceTabId, url) {
+  const newHost = uriHostname(url);
+  if (!newHost) return;
+  const provider = FEDERATED_PROVIDER_HOSTS.find((p) => p.hostRe.test(newHost));
+  if (!provider) return;
+  const key = `lastTabHost:${sourceTabId}`;
+  const { [key]: sourceHost } = await chrome.storage.session.get([key]);
+  if (!sourceHost) return; // 원본 탭 호스트를 아직 모르면(추적 시작 전 탭) 포기
+  console.debug(`[federated] tab ${sourceTabId}: 팝업으로 ${newHost} 열림 (${provider.name}) — pending 기록(원본 탭 기준)`);
+  await setPendingFederated(sourceTabId, provider.name, sourceHost);
+}
+
+async function takePendingFederated(tabId, frameUrl) {
+  const key = `pendingFederated:${tabId}`;
+  const { [key]: entry } = await chrome.storage.session.get([key]);
+  if (!entry) {
+    console.debug(`[federated] tab ${tabId}: pending 기록 없음 (frame=${uriHostname(frameUrl)})`);
+    return null;
+  }
+  if (entry.originHost !== uriHostname(frameUrl)) {
+    // 지우면 안 된다 — content.js는 <all_urls>라 지금 이 순간에도 accounts.google.com 자기 자신의
+    // 페이지에서 돌고 있고, 거기서도 이걸 확인한다. 그때는 당연히 origin이 안 맞는다(아직 github.com으로
+    // 안 돌아왔을 뿐). 여기서 지워버리면 나중에 진짜 github.com으로 돌아왔을 때 볼 기록이 없어진다.
+    console.debug(`[federated] tab ${tabId}: origin 불일치 (기록=${entry.originHost}, 지금=${uriHostname(frameUrl)}) — 아직 때가 아님, 보존`);
+    return null;
+  }
+  if (Date.now() - entry.createdAt > PENDING_FEDERATED_TTL_MS) {
+    await chrome.storage.session.remove([key]);
+    console.debug(`[federated] tab ${tabId}: TTL 만료 — 버림`);
+    return null;
+  }
+  const session = await getSession();
+  if (!session) {
+    // 잠겨 있으면 여기서 지우지 않는다 — 구글 계정 선택/OTP를 거치는 동안 자동 잠금이 걸리면
+    // (기본 15분) 그 순간 지워버려서 잠금 해제 후에도 다시는 못 보게 되는 게 더 나쁘다.
+    // TTL 안에서 다음 페이지 로드 때 다시 시도할 수 있게 그대로 둔다.
+    console.debug(`[federated] tab ${tabId}: 잠겨 있어 판단 보류(안 지움) — 잠금 해제 후 재시도`);
+    return null;
+  }
+  await chrome.storage.session.remove([key]); // 이제 보여줄지 결정할 수 있으니, 한 번 보여주면 끝
+  const { items } = await getItemList();
+  // 일반 비밀번호 항목(예: 기존 GitHub 아이디/비번)은 여기서 걸러지면 안 된다 — 이미 저장된
+  // "페더레이션 로그인" 표식 항목(saveFederatedLogin이 만드는, 비밀번호 없는 항목)만 중복으로 본다.
+  const alreadySaved = items.some((item) => !item.hasPassword && item.uris.some((u) => uriMatches(u.uri, u.match, frameUrl)));
+  if (alreadySaved) {
+    console.debug(`[federated] tab ${tabId}: 비밀번호 없는 항목이 이미 있어 배너 생략 (${entry.provider})`);
+    return null;
+  }
+  console.debug(`[federated] tab ${tabId}: 배너 표시 (${entry.provider})`);
+  return { provider: entry.provider };
+}
+
+async function saveFederatedLogin(host, provider) {
+  const epoch = lockEpoch;
+  const session = await getSession();
+  if (!session) throw new Error("Locked");
+  const userKey = userKeyFromSession(session);
+  const client = new VaultwardenClient(session.serverUrl);
+  const payload = {
+    type: 1,
+    name: await encryptString(host, userKey),
+    notes: await encryptString(`${provider} 계정으로 로그인함`, userKey),
+    favorite: false,
+    folderId: null,
+    organizationId: null,
+    login: {
+      username: null,
+      password: null,
+      totp: null,
+      uris: [{ uri: await encryptString(`https://${host}`, userKey), match: null }],
+    },
+  };
+  const created = await client.createCipher(session.accessToken, payload);
+  const current = await getSession();
+  if (!current) throw new Error("Locked");
+  await updateSession({ ...current, ciphers: [...current.ciphers, created] }, epoch);
+}
+
+// 이메일 → 비밀번호[ → OTP] 같은 다단계 로그인은 구글처럼 단계마다 완전히 새 페이지로 넘어가는 경우가 많다.
+// content.js의 메모리 상태(pendingFillId)는 새 페이지가 뜨면 날아가므로, 여기 탭별로 하나 더 들고 있다가
+// 다음 페이지가 뜨면 content.js가 복원해서 이어 채운다 — 안 그러면 다음 단계에서 계정 선택창이 또 뜬다.
+const PENDING_FILL_TTL_MS = 5 * 60 * 1000;
+
+async function setPendingFill(tabId, id, step) {
+  await chrome.storage.session.set({ [`pendingFill:${tabId}`]: { id, step, createdAt: Date.now() } });
+}
+
+async function getPendingFill(tabId) {
+  const key = `pendingFill:${tabId}`;
+  const { [key]: entry } = await chrome.storage.session.get([key]);
+  if (!entry) return null;
+  if (Date.now() - entry.createdAt > PENDING_FILL_TTL_MS) {
+    await chrome.storage.session.remove([key]);
+    return null;
+  }
+  return { id: entry.id, step: entry.step };
+}
+
+async function clearPendingFill(tabId) {
+  await chrome.storage.session.remove([`pendingFill:${tabId}`]);
 }
 
 async function saveItem({ host, username, password }) {
@@ -452,6 +671,19 @@ async function saveItem({ host, username, password }) {
   await updateSession({ ...current, ciphers: [...current.ciphers, created] }, epoch);
 }
 
+async function deleteItem(id) {
+  const epoch = lockEpoch;
+  const session = await getSession();
+  if (!session) throw new Error("Locked");
+  const cipher = session.ciphers.find((c) => cipherField(c, "id", "Id") === id);
+  if (!cipher) throw new Error("항목을 찾을 수 없습니다.");
+  const client = new VaultwardenClient(session.serverUrl);
+  await client.deleteCipher(session.accessToken, id);
+  const current = await getSession();
+  if (!current) throw new Error("Locked");
+  await updateSession({ ...current, ciphers: current.ciphers.filter((c) => cipherField(c, "id", "Id") !== id) }, epoch);
+}
+
 const MAX_IMPORT_ENTRIES = 2000;
 const MAX_FOLDER_NAME_LENGTH = 100;
 
@@ -474,8 +706,8 @@ async function importItems(entries, folderSelection = {}) {
   }
 
   const { items: existing } = await getItemList();
-  const alreadySaved = (username, host) =>
-    existing.some((item) => item.username === username && item.uris.some((u) => isSameSite(uriHostname(u), host)));
+  const alreadySaved = (username, url) =>
+    existing.some((item) => item.username === username && item.uris.some((u) => uriMatches(u.uri, u.match, url)));
 
   const created = [];
   let skipped = 0;
@@ -486,7 +718,7 @@ async function importItems(entries, folderSelection = {}) {
       failed += 1;
       continue;
     }
-    if (alreadySaved(entry.username || null, host)) {
+    if (alreadySaved(entry.username || null, entry.url)) {
       skipped += 1;
       continue;
     }
@@ -526,16 +758,19 @@ async function importItems(entries, folderSelection = {}) {
 }
 
 // 현재 탭 사이트와 일치하는 저장된 계정 목록(이름/사용자명만, 비밀번호 없음).
+// locked를 같이 돌려준다 — 잠겨서 items가 빈 것과, 정말 매칭이 없는 것을 content.js가 구분해야
+// 필드 아이콘을 "잠금 해제하기"로 보여줄지 그냥 숨길지 정할 수 있다.
 async function getHostMatches(tabUrl) {
   const host = uriHostname(tabUrl);
-  if (!host) return [];
-  if (!(await getSession())) return [];
+  if (!host) return { items: [], locked: !(await getSession()) };
+  if (!(await getSession())) return { items: [], locked: true };
   const { items } = await getItemList();
   const { lastUsed = {} } = await chrome.storage.local.get(["lastUsed"]);
-  return items
-    .filter((item) => item.uris.some((u) => isSameSite(uriHostname(u), host)))
-    .map(({ id, name, username, hasTotp }) => ({ id, name, username, hasTotp, lastUsedAt: lastUsed[id] || null }))
+  const matched = items
+    .filter((item) => item.uris.some((u) => uriMatches(u.uri, u.match, tabUrl)))
+    .map(({ id, name, username, hasTotp, hasPassword }) => ({ id, name, username, hasTotp, hasPassword, lastUsedAt: lastUsed[id] || null }))
     .sort((a, b) => (b.lastUsedAt || 0) - (a.lastUsedAt || 0));
+  return { items: matched, locked: false };
 }
 
 // 항목 id → 마지막 자동입력 시각. 어느 사이트였는지는 남기지 않는다(방문 기록이 되지 않게).
@@ -555,7 +790,7 @@ async function requestAutofill(id, tab, frameUrl, documentId, submit) {
   const cipher = session.ciphers.find((c) => cipherField(c, "id", "Id") === id);
   if (!cipher) return { ok: false, error: "항목을 찾을 수 없습니다." };
   const summary = await decryptCipherSummary(cipher, userKey).catch(() => null);
-  if (!summary || !summary.uris.some((u) => isSameSite(uriHostname(u), host))) {
+  if (!summary || !summary.uris.some((u) => uriMatches(u.uri, u.match, frameUrl))) {
     return { ok: false, error: "사이트가 일치하지 않습니다." };
   }
   const { password, totp } = await getItemSecrets(id);
@@ -570,9 +805,12 @@ async function requestAutofill(id, tab, frameUrl, documentId, submit) {
   return { ok: true, hasTotp: summary.hasTotp };
 }
 
-// otpauth://totp/... 형태만 받는다(HOTP는 카운터 기반이라 generateTotp가 처리 못 함).
-function isValidOtpauthUri(value) {
+// otpauth://totp/...?secret=... 형태나, 사이트가 "직접 입력" 텍스트로 보여주는 순수 base32 시크릿
+// 둘 다 받는다(HOTP는 카운터 기반이라 generateTotp가 처리 못 해 otpauth:// 쪽은 totp만 허용).
+const BASE32_SECRET_RE = /^[A-Z2-7]{16,32}$/;
+function isValidTotpSecret(value) {
   if (typeof value !== "string" || value.length > 2000) return false;
+  if (BASE32_SECRET_RE.test(value)) return true;
   try {
     const url = new URL(value);
     return url.protocol === "otpauth:" && url.host.toLowerCase() === "totp" && !!url.searchParams.get("secret");
@@ -581,17 +819,26 @@ function isValidOtpauthUri(value) {
   }
 }
 
-// 2FA 설정 페이지가 보여준 otpauth:// 시크릿을, 이 사이트에 이미 저장된(그리고 아직 TOTP가 없는) 계정에 붙인다.
-// ponytail: 같은 사이트에 TOTP 없는 계정이 둘 이상이면 어느 것인지 알 수 없어 거부한다 — 필요해지면 선택 UI 추가.
-async function saveTotpForHost(host, otpauthUri) {
+// 2FA 설정 페이지가 보여준 시크릿을, 이 사이트에 이미 저장된(그리고 아직 TOTP가 없는) 계정에 붙인다.
+// TOTP 없는 계정이 후보 하나뿐이면 itemId 없이도 그 계정으로 정해지고, 둘 이상이면 content.js가
+// 고른 itemId가 필요하다(없으면 어느 것인지 알 수 없어 거부).
+async function saveTotpForHost(url, secret, itemId) {
   const epoch = lockEpoch;
   const session = await getSession();
   if (!session) throw new Error("Locked");
   const { items } = await getItemList();
-  const matches = items.filter((item) => !item.hasTotp && item.uris.some((u) => isSameSite(uriHostname(u), host)));
-  if (matches.length === 0) throw new Error("이 사이트에 저장된 계정이 없습니다.");
-  if (matches.length > 1) throw new Error("저장할 계정을 하나로 특정할 수 없습니다.");
-  const target = matches[0];
+  const matches = items.filter((item) => !item.hasTotp && item.uris.some((u) => uriMatches(u.uri, u.match, url)));
+  let target;
+  if (itemId) {
+    target = matches.find((item) => item.id === itemId);
+    if (!target) throw new Error("선택한 계정을 찾을 수 없습니다.");
+  } else if (matches.length === 0) {
+    throw new Error("이 사이트에 저장된 계정이 없습니다.");
+  } else if (matches.length > 1) {
+    throw new Error("저장할 계정을 하나로 특정할 수 없습니다.");
+  } else {
+    target = matches[0];
+  }
   const cipher = session.ciphers.find((c) => cipherField(c, "id", "Id") === target.id);
   if (!cipher) throw new Error("항목을 찾을 수 없습니다.");
   const userKey = userKeyFromSession(session);
@@ -606,7 +853,7 @@ async function saveTotpForHost(host, otpauthUri) {
     login: {
       username: cipherField(login, "username", "Username") ?? null,
       password: cipherField(login, "password", "Password") ?? null,
-      totp: await encryptString(otpauthUri, userKey),
+      totp: await encryptString(secret, userKey),
       uris: cipherField(login, "uris", "Uris") ?? [],
     },
   };
@@ -632,6 +879,22 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   clearSession().catch((err) => console.error("auto-lock failed:", err));
 });
 
+// chrome.tabs.onUpdated 대신 chrome.webNavigation.onCommitted를 쓴다 — "탭 URL이 바뀜"이 아니라 "네비게이션이
+// 실제로 커밋됨"이라는 더 명확한 공식 신호다(1Password도 이 API를 쓴다). onCreatedNavigationTarget은
+// tabs.onUpdated로는 원천적으로 못 보는 경우(SSO를 팝업/새 탭으로 여는 사이트)까지 잡아준다.
+chrome.webNavigation.onCommitted.addListener((details) => {
+  if (details.frameId !== 0) return; // 최상위 프레임만 — iframe 안 이동은 무시
+  trackFederatedNavigation(details.tabId, details.url).catch((err) => console.warn("federated nav tracking failed:", err.message));
+});
+chrome.webNavigation.onCreatedNavigationTarget.addListener((details) => {
+  trackFederatedPopup(details.sourceTabId, details.url).catch((err) => console.warn("federated popup tracking failed:", err.message));
+});
+chrome.tabs.onRemoved.addListener((tabId) => {
+  chrome.storage.session
+    .remove([`lastTabHost:${tabId}`, `pendingFederated:${tabId}`])
+    .catch(() => {});
+});
+
 // Only the extension's own pages (popup/options, even when opened in a tab) may talk to
 // the vault; content scripts carry sender.tab with a web page url.
 function isExtensionPage(sender) {
@@ -643,15 +906,23 @@ function isExtensionPage(sender) {
 // content.js(모든 웹페이지에서 실행)가 보낼 수 있는 메시지는 이 목록으로 제한한다.
 // 각 핸들러는 클라이언트가 보낸 host/id를 그대로 믿지 않고 프레임 URL(sender.url)로 다시 검증한다.
 const CONTENT_SCRIPT_MESSAGE_TYPES = new Set([
+  "GET_STATUS",
+  "UNLOCK",
+  "UNLOCK_PIN",
   "GET_HOST_MATCHES",
   "REQUEST_AUTOFILL",
   "PENDING_SAVE",
   "GET_PENDING_SAVE",
   "SAVE_ITEM",
   "SAVE_TOTP",
+  "SET_PENDING_FILL",
+  "GET_PENDING_FILL",
+  "CLEAR_PENDING_FILL",
+  "GET_PENDING_FEDERATED",
+  "SAVE_FEDERATED_LOGIN",
 ]);
 
-const USER_ACTION_MESSAGE_TYPES = new Set(["REQUEST_AUTOFILL", "SAVE_ITEM", "SAVE_TOTP"]);
+const USER_ACTION_MESSAGE_TYPES = new Set(["REQUEST_AUTOFILL", "SAVE_ITEM", "SAVE_TOTP", "SAVE_FEDERATED_LOGIN", "UNLOCK", "UNLOCK_PIN"]);
 
 function isAllowedSender(msg, sender) {
   if (isExtensionPage(sender)) return true;
@@ -676,7 +947,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const session = await getSession();
           const cfg = await getConfig();
           const vault = await getVault();
-          const { pin } = await chrome.storage.session.get(["pin"]);
+          const { pin } = await chrome.storage.local.get(["pin"]);
           sendResponse({
             locked: !session,
             canUnlock: !!vault, // 로컬 금고가 있으면 서버 로그인 없이 비밀번호/PIN으로 연다
@@ -702,7 +973,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         }
         case "REMOVE_PIN": {
-          await chrome.storage.session.remove(["pin"]);
+          await chrome.storage.local.remove(["pin"]);
           sendResponse({ ok: true });
           break;
         }
@@ -738,7 +1009,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "GET_ITEMS": {
           const { items, skipped } = await getItemList();
-          sendResponse({ ok: true, items, skipped });
+          const { lastUsed = {} } = await chrome.storage.local.get(["lastUsed"]);
+          sendResponse({ ok: true, items: items.map((i) => ({ ...i, lastUsedAt: lastUsed[i.id] || null })), skipped });
           break;
         }
         case "GET_FOLDERS": {
@@ -751,8 +1023,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         }
         case "GET_HOST_MATCHES": {
-          const items = await getHostMatches(frameUrl);
-          sendResponse({ ok: true, items });
+          const { items, locked } = await getHostMatches(frameUrl);
+          sendResponse({ ok: true, items, locked });
           break;
         }
         case "REQUEST_AUTOFILL": {
@@ -762,7 +1034,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case "PENDING_SAVE": {
           const host = uriHostname(frameUrl);
           if (host && isCapturedFieldValid(msg.password, { required: true }) && isCapturedFieldValid(msg.username, { required: false })) {
-            await maybeQueuePendingSave(sender.tab.id, host, msg.username || null, msg.password);
+            await maybeQueuePendingSave(sender.tab.id, host, frameUrl, msg.username || null, msg.password);
           }
           sendResponse({ ok: true });
           break;
@@ -772,12 +1044,71 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, pending });
           break;
         }
+        case "SET_PENDING_FILL": {
+          if (typeof msg.id === "string" && msg.id.length > 0 && msg.id.length <= 100 && (msg.step === "password" || msg.step === "otp")) {
+            await setPendingFill(sender.tab.id, msg.id, msg.step);
+          }
+          sendResponse({ ok: true });
+          break;
+        }
+        case "GET_PENDING_FILL": {
+          sendResponse({ ok: true, pending: await getPendingFill(sender.tab.id) });
+          break;
+        }
+        case "CLEAR_PENDING_FILL": {
+          await clearPendingFill(sender.tab.id);
+          sendResponse({ ok: true });
+          break;
+        }
+        case "GET_PENDING_FEDERATED": {
+          sendResponse({ ok: true, pending: await takePendingFederated(sender.tab.id, frameUrl) });
+          break;
+        }
+        case "SAVE_FEDERATED_LOGIN": {
+          if (uriHostname(frameUrl) !== msg.host || !KNOWN_FEDERATED_PROVIDERS.has(msg.provider)) {
+            sendResponse({ ok: false, error: "잘못된 요청입니다." });
+            break;
+          }
+          await saveFederatedLogin(msg.host, msg.provider);
+          sendResponse({ ok: true });
+          break;
+        }
         case "SAVE_ITEM": {
           if (uriHostname(frameUrl) !== msg.host) {
             sendResponse({ ok: false, error: "사이트가 일치하지 않습니다." });
             break;
           }
           await saveItem({ host: msg.host, username: msg.username, password: msg.password });
+          sendResponse({ ok: true });
+          break;
+        }
+        case "UPDATE_ITEM": {
+          if (typeof msg.id !== "string" || !msg.id) {
+            sendResponse({ ok: false, error: "잘못된 요청입니다." });
+            break;
+          }
+          if (!isCapturedFieldValid(msg.name, { required: true }) || !isCapturedFieldValid(msg.password, { required: true })) {
+            sendResponse({ ok: false, error: "이름과 비밀번호는 필수입니다." });
+            break;
+          }
+          const uris = Array.isArray(msg.uris) ? msg.uris.filter((u) => isCapturedFieldValid(u, { required: true })) : [];
+          await updateItem(msg.id, {
+            name: msg.name,
+            username: isCapturedFieldValid(msg.username, { required: false }) ? msg.username : null,
+            password: msg.password,
+            notes: isCapturedFieldValid(msg.notes, { required: false }) ? msg.notes : null,
+            uris,
+            removeTotp: !!msg.removeTotp,
+          });
+          sendResponse({ ok: true });
+          break;
+        }
+        case "DELETE_ITEM": {
+          if (typeof msg.id !== "string" || !msg.id) {
+            sendResponse({ ok: false, error: "잘못된 요청입니다." });
+            break;
+          }
+          await deleteItem(msg.id);
           sendResponse({ ok: true });
           break;
         }
@@ -790,11 +1121,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         }
         case "SAVE_TOTP": {
-          if (uriHostname(frameUrl) !== msg.host || !isValidOtpauthUri(msg.otpauth)) {
+          if (uriHostname(frameUrl) !== msg.host || !isValidTotpSecret(msg.secret)) {
             sendResponse({ ok: false, error: "잘못된 요청입니다." });
             break;
           }
-          await saveTotpForHost(msg.host, msg.otpauth);
+          await saveTotpForHost(frameUrl, msg.secret, typeof msg.itemId === "string" ? msg.itemId : undefined);
           sendResponse({ ok: true });
           break;
         }

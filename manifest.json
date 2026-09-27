@@ -18,9 +18,11 @@
   },
   "permissions": [
     "storage",
+    "unlimitedStorage",
     "activeTab",
     "scripting",
-    "alarms"
+    "alarms",
+    "webNavigation"
   ],
   "host_permissions": [
     "https://localhost:8443/*",
