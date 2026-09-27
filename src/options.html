@@ -5,22 +5,8 @@
 <title>Keyfort — 설정</title>
 <link rel="stylesheet" href="popup.css" />
 </head>
-<body class="page">
-  <h1 id="brand"></h1>
-  <p>이 확장 프로그램은 팝업에서 로그인/설정합니다. 팝업 아이콘을 클릭해 시작하세요.</p>
-  <p>서버 URL은 자체 호스팅 Vaultwarden 인스턴스를 사용하세요 (예: https://localhost:8443).</p>
-
-  <section class="settings-card">
-    <div class="settings-title">가져오기</div>
-    <div class="settings-desc">Chrome, Arc, Edge, Brave 같은 Chromium 브라우저나 1Password에서 내보낸 CSV 파일을 그대로 불러옵니다. 이미 저장된 계정(같은 아이디+사이트)은 자동으로 건너뜁니다.</div>
-    <input type="file" id="importFile" accept=".csv,text/csv" />
-    <label class="field-label" for="importFolder">폴더</label>
-    <select id="importFolder"><option value="">(폴더 없음)</option></select>
-    <input type="text" id="importNewFolder" placeholder="또는 새 폴더 이름 (예: 회사) — 입력하면 이쪽이 우선" maxlength="100" />
-    <button class="btn btn-primary" id="importBtn" disabled>가져오기</button>
-    <div id="importStatus"></div>
-  </section>
-
+<body class="options-page">
+  <div id="app"></div>
   <script type="module" src="options.js"></script>
 </body>
 </html>
