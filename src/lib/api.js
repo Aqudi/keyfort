@@ -103,7 +103,13 @@ export class VaultwardenClient {
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body.toString(),
     });
-    if (!res.ok) throw new Error(`refresh failed: ${res.status}`);
+    if (!res.ok) {
+      // Vaultwarden refresh tokens rotate (single-use): a 400/401 here means this token is dead for
+      // good, not a transient failure — the caller uses `status` to tell that apart from being offline.
+      const err = new Error(`refresh failed: ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
     return res.json();
   }
 

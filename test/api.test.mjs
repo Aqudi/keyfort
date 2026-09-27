@@ -173,6 +173,16 @@ test("createFolder throws the server's error message on failure", async () => {
   await assert.rejects(new VaultwardenClient("https://vault.test").createFolder("tok", "enc-name"), /bad folder/);
 });
 
+test("refreshToken attaches the HTTP status to the thrown error", async () => {
+  // Vaultwarden refresh tokens rotate (single-use); background.js's ensureFreshToken needs the
+  // status to tell "this token is permanently dead" (400/401) apart from a transient/offline failure.
+  fetchImpl = async () => jsonResponse({ error: "invalid_grant" }, 400);
+  await assert.rejects(
+    () => new VaultwardenClient("https://vault.test").refreshToken("dead-token"),
+    (err) => err.status === 400 && /refresh failed: 400/.test(err.message)
+  );
+});
+
 test("deleteCipher sends a DELETE to the cipher's id", async () => {
   let sentUrl, sentOpts;
   fetchImpl = async (url, opts) => {
