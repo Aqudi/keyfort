@@ -609,7 +609,10 @@ async function saveFederatedLogin(host, provider) {
     folderId: null,
     organizationId: null,
     login: {
-      username: null,
+      // username 자리에 provider 이름을 넣어둔다 — GET_HOST_MATCHES 요약에 그대로 노출되니(추가 복호화
+      // 없이), 계정 선택 목록에서 "이 항목은 Google로 로그인한다"를 바로 보여주고, 클릭했을 때 페이지의
+      // 어느 "Continue with ___" 버튼을 눌러야 할지도 이걸로 찾는다.
+      username: await encryptString(provider, userKey),
       password: null,
       totp: null,
       uris: [{ uri: await encryptString(`https://${host}`, userKey), match: null }],

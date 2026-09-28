@@ -755,7 +755,9 @@ test("SAVE_FEDERATED_LOGIN creates a passwordless login item noting the identity
 
   assert.equal(res.ok, true);
   assert.equal(posted.body.login.password, null);
-  assert.equal(posted.body.login.username, null);
+  // username에는 provider 이름을 넣어둔다 — content.js가 GET_HOST_MATCHES 요약만으로(추가 복호화 없이)
+  // "이 항목은 Google로 로그인한다"는 걸 알고 그 이름으로 "Continue with Google" 버튼을 찾아 누를 수 있게.
+  assert.equal(await decryptEncString(posted.body.login.username, userKey), "Google");
   assert.equal(await decryptEncString(posted.body.notes, userKey), "Google 계정으로 로그인함");
   assert.equal(await decryptEncString(posted.body.login.uris[0].uri, userKey), "https://github.test");
 });

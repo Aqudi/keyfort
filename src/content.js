@@ -136,6 +136,21 @@ function submitFrom(input) {
   input.dispatchEvent(new KeyboardEvent("keyup", opts));
 }
 
+// 페더레이션(SSO) 항목은 채울 아이디/비밀번호가 없다 — 저장된 그대로 이 사이트의 "Continue with
+// Google" 같은 버튼을 찾아 대신 눌러준다(saveFederatedLogin이 username 자리에 provider 이름을 넣어둠).
+const SSO_BUTTON_HINT = /continue|sign.?in|log.?in|로그인|계속/i;
+function findProviderButton(provider) {
+  if (!provider) return null;
+  const candidates = deepQueryAll('button, a[role="button"], a').filter(isVisible);
+  const providerRe = new RegExp(provider.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  const withText = (el) => el.textContent || el.getAttribute("aria-label") || el.value || "";
+  return (
+    candidates.find((el) => providerRe.test(withText(el)) && SSO_BUTTON_HINT.test(withText(el))) ||
+    candidates.find((el) => providerRe.test(withText(el))) ||
+    null
+  );
+}
+
 // 다단계 로그인(이메일 → 비밀번호[ → OTP])에서 앞 단계를 채운 항목과, 다음에 기다리는 단계.
 // ponytail: 메모리에만 있어서 단계 사이에 전체 페이지 이동이 있으면 이어지지 않는다(SPA라면 괜찮음).
 let pendingFillId = null;
@@ -669,6 +684,20 @@ function renderAccountMenu(input, items, onSelect) {
 
 function openFieldDropdown(input, items) {
   renderAccountMenu(input, items, async (item, btn) => {
+    // 페더레이션 항목(비밀번호 없음) — 채울 게 없으니 그 제공자의 "Continue with ___" 버튼을 대신 눌러준다.
+    if (item.hasPassword === false) {
+      const providerBtn = findProviderButton(item.username);
+      if (!providerBtn) {
+        btn.querySelector(".m-text").insertAdjacentHTML(
+          "beforeend",
+          `<div class="m-user">이 페이지에서 "${escapeHtml(item.username || "해당")}" 로그인 버튼을 못 찾았습니다.</div>`
+        );
+        return false;
+      }
+      removeAllFieldIcons();
+      providerBtn.click();
+      return true;
+    }
     const res = await send({ type: "REQUEST_AUTOFILL", id: item.id, submit: true });
     if (!res?.ok) {
       btn.querySelector(".m-text").insertAdjacentHTML("beforeend", `<div class="m-user">${escapeHtml(res?.error || "자동입력 실패")}</div>`);
