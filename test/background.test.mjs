@@ -525,6 +525,36 @@ test("PENDING_SAVE ignores an oversized captured value instead of storing it", a
   assert.equal(res.pending, null);
 });
 
+test("NOTE_USERNAME survives a full-page navigation: PENDING_SAVE on the password-only next page still gets the username", async () => {
+  // AWS SSO/Google 식 2단계 로그인: 1단계(아이디만)에서 다음 페이지로 전체 네비게이션하면 content.js가
+  // 다시 주입되어 메모리 상태가 날아간다 — 그래서 아이디는 탭 기준으로 background에 맡겨 둬야 한다.
+  seedSession([]);
+  const tabId = 3;
+  await send({ type: "NOTE_USERNAME", username: "me@example.test" }, contentScriptSender(tabId, "https://newsite.test/signin"));
+
+  await send(
+    { type: "PENDING_SAVE", username: null, password: "hunter2" },
+    contentScriptSender(tabId, "https://newsite.test/signin/password")
+  );
+  const res = await send({ type: "GET_PENDING_SAVE" }, contentScriptSender(tabId, "https://newsite.test/signin/password"));
+
+  assert.deepEqual(res.pending, { host: "newsite.test", username: "me@example.test", password: "hunter2" });
+});
+
+test("PENDING_SAVE prefers a username visible on the current page over a stashed NOTE_USERNAME", async () => {
+  seedSession([]);
+  const tabId = 3;
+  await send({ type: "NOTE_USERNAME", username: "wrong@example.test" }, contentScriptSender(tabId, "https://newsite.test/signin"));
+
+  await send(
+    { type: "PENDING_SAVE", username: "right@example.test", password: "hunter2" },
+    contentScriptSender(tabId, "https://newsite.test/signin")
+  );
+  const res = await send({ type: "GET_PENDING_SAVE" }, contentScriptSender(tabId, "https://newsite.test/signin"));
+
+  assert.equal(res.pending.username, "right@example.test");
+});
+
 test("GET_PENDING_SAVE refuses a stale entry if the tab navigated to a different site meanwhile", async () => {
   seedSession([]);
   await send({ type: "PENDING_SAVE", username: "me@example.test", password: "hunter2" }, contentScriptSender(3, "https://siteA.test/login"));

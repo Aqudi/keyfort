@@ -854,7 +854,6 @@ function attachFieldIcon(input, items, { locked = false, mode = "login" } = {}) 
 }
 
 let overlayShown = false;
-let lastUsername = null; // 이메일 단계에서 입력한 값 — 다음 단계의 비밀번호와 묶어 저장 제안에 쓴다
 
 // 구글처럼 이메일→비밀번호[→OTP] 단계가 완전히 새 페이지로 넘어가는 로그인은, 이 페이지의 메모리 상태가
 // 다음 페이지에선 사라진다. background.js에 탭 단위로 복사해 두면 다음 페이지가 뜰 때 복원해서 이어 채울 수
@@ -956,11 +955,14 @@ function captureCredentials(e) {
   if (!fields) return;
   const username = fields.usernameInput?.value || null;
   if (!fields.passwordInput) {
-    if (username) lastUsername = username;
+    // 이 단계엔 비밀번호 칸이 없다 — AWS SSO/Google처럼 다음 단계가 완전히 새 페이지(전체 네비게이션)일
+    // 수 있으니, 이 페이지의 메모리가 아니라 탭 기준으로 background에 맡겨 다음 페이지에서도 살아남게 한다.
+    if (username) send({ type: "NOTE_USERNAME", username }).catch(() => {});
     return;
   }
   if (!fields.passwordInput.value) return;
-  send({ type: "PENDING_SAVE", username: username || lastUsername, password: fields.passwordInput.value }).catch(() => {});
+  // username이 이 페이지에 안 보이면(2단계만 새로 뜬 페이지) background가 1단계에서 맡겨둔 값으로 채운다.
+  send({ type: "PENDING_SAVE", username, password: fields.passwordInput.value }).catch(() => {});
   // SPA 로그인은 페이지 리로드가 없으니, 잠시 뒤 로그인 폼이 사라졌으면 여기서 바로 저장 제안을 띄운다.
   setTimeout(async () => {
     if (findLoginFields()?.passwordInput) return; // 아직 폼이 있음 = 로그인 실패 또는 진행 중

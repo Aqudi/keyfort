@@ -497,6 +497,22 @@ async function takePendingSave(tabId, tabUrl) {
   return { host: entry.host, username: entry.username, password: entry.password };
 }
 
+// AWS SSO, Google, Microsoft 등 "아이디 먼저 입력 → 다음 → 별도 페이지에서 비밀번호" 흐름은 전체
+// 페이지 이동(full navigation)을 거치는 경우가 많다 — 그러면 content.js가 다시 주입되며 메모리상
+// 변수는 전부 리셋된다. 그래서 1단계에서 입력한 아이디를 탭 기준으로 background에 잠깐 맡겨두고,
+// 2단계(비밀번호만 있는 폼)에서 저장 제안을 큐에 넣을 때 다시 꺼내 합친다.
+async function noteUsernameStep(tabId, username) {
+  await chrome.storage.session.set({ [`lastUsername:${tabId}`]: { username, createdAt: Date.now() } });
+}
+
+async function takeLastUsername(tabId) {
+  const key = `lastUsername:${tabId}`;
+  const { [key]: entry } = await chrome.storage.session.get([key]);
+  if (!entry) return null;
+  if (Date.now() - entry.createdAt > PENDING_SAVE_TTL_MS) return null;
+  return entry.username;
+}
+
 // "Google로 로그인" 같은 페더레이션 로그인은 이 사이트만 봐서는 비밀번호가 아예 없다 — 1Password처럼
 // "Google이(가) 여기 로그인에 사용됨"이라는 연결 기록만 저장한다.
 //
@@ -915,6 +931,7 @@ const CONTENT_SCRIPT_MESSAGE_TYPES = new Set([
   "GET_HOST_MATCHES",
   "REQUEST_AUTOFILL",
   "PENDING_SAVE",
+  "NOTE_USERNAME",
   "GET_PENDING_SAVE",
   "SAVE_ITEM",
   "SAVE_TOTP",
@@ -1037,7 +1054,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case "PENDING_SAVE": {
           const host = uriHostname(frameUrl);
           if (host && isCapturedFieldValid(msg.password, { required: true }) && isCapturedFieldValid(msg.username, { required: false })) {
-            await maybeQueuePendingSave(sender.tab.id, host, frameUrl, msg.username || null, msg.password);
+            const username = msg.username || (await takeLastUsername(sender.tab.id));
+            await maybeQueuePendingSave(sender.tab.id, host, frameUrl, username || null, msg.password);
+          }
+          sendResponse({ ok: true });
+          break;
+        }
+        case "NOTE_USERNAME": {
+          if (isCapturedFieldValid(msg.username, { required: true })) {
+            await noteUsernameStep(sender.tab.id, msg.username);
           }
           sendResponse({ ok: true });
           break;
